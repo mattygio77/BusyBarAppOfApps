@@ -1,0 +1,33 @@
+{
+  "device_ip": "10.0.4.20",
+  "redis_host": "localhost",
+  "redis_port": 6379,
+  "apps": [
+    {
+      "id": "weather",
+      "path": "./apps/weather_app.py",
+      "enabled": true,
+      "proposed_interval_seconds": 300,
+      "override_interval_seconds": null,
+      "default_priority": 50
+    }
+  ],
+  "idle_rotation": {
+    "enabled": true,
+    "cycle_seconds": 30,
+    "content": [
+      {
+        "id": "idle_text",
+        "type": "text",
+        "text": "Idle...",
+        "x": 20,
+        "y": 8,
+        "font": "small",
+        "color": "#FFFFFFFF",
+        "width": 72,
+        "scroll_rate": 0,
+        "timeout": 6
+      }
+    ]
+  }
+}
