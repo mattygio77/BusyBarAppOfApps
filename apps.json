@@ -11,23 +11,5 @@
       "override_interval_seconds": null,
       "default_priority": 50
     }
-  ],
-  "idle_rotation": {
-    "enabled": true,
-    "cycle_seconds": 30,
-    "content": [
-      {
-        "id": "idle_text",
-        "type": "text",
-        "text": "Idle...",
-        "x": 20,
-        "y": 8,
-        "font": "small",
-        "color": "#FFFFFFFF",
-        "width": 72,
-        "scroll_rate": 0,
-        "timeout": 6
-      }
-    ]
-  }
+  ]
 }

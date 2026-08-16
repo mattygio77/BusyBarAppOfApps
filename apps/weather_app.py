@@ -61,33 +61,45 @@ class WeatherApp:
         app_id: str,
         priority: int,
         interval_seconds: int,
+        display_seconds: int = 10,
         redis_host: str = "localhost",
         redis_port: int = 6379,
         device_ip: str = "10.0.4.20",
         city_name: str = "Washington DC",
         latitude: float = 38.9072,
         longitude: float = -77.0369,
+        show_city: bool = True,
     ):
         """Initialize weather app.
         
         Args:
             app_id: Unique identifier for this app
             priority: Display priority (0-100)
-            interval_seconds: How often to fetch and publish
+            interval_seconds: How often to fetch weather from the API
+            display_seconds: How long the weather "owns" the display each
+                time it publishes, before yielding back to idle. This is
+                intentionally much shorter than interval_seconds -- weather
+                should interrupt idle briefly, not camp on top of it.
             redis_host: Redis server host
             redis_port: Redis server port
             device_ip: BusyBar device IP (for uploading icons)
             city_name: City name to display
             latitude: Location latitude
             longitude: Location longitude
+            show_city: Whether to prefix the display text with city_name.
+                Defaults on. The front display is only 72px wide, so with
+                the city name included the text scrolls to fit next to the
+                icon rather than getting clipped.
         """
         self.app_id = app_id
         self.priority = priority
         self.interval_seconds = interval_seconds
+        self.display_seconds = display_seconds
         self.city_name = city_name
         self.latitude = latitude
         self.longitude = longitude
         self.device_ip = device_ip
+        self.show_city = show_city
         
         # Redis client
         self.redis_client = redis.Redis(
@@ -99,6 +111,10 @@ class WeatherApp:
         
         # Icon folder (same directory as this script)
         self.icon_folder = Path(__file__).parent / "weather" / "icons"
+        
+        # Icons already uploaded to the device this run, so we don't
+        # re-upload the same PNG every single fetch cycle.
+        self.uploaded_icons = set()
         
         # Shutdown flag
         self.shutdown = False
@@ -164,6 +180,10 @@ class WeatherApp:
         Returns:
             Path to use in display elements (e.g., "sun.png")
         """
+        # Skip re-uploading an icon we already pushed to the device this run.
+        if icon_filename in self.uploaded_icons:
+            return icon_filename
+        
         local_path = self.icon_folder / icon_filename
         
         if not local_path.exists():
@@ -191,6 +211,7 @@ class WeatherApp:
             
             if response.status_code == 200:
                 logger.debug(f"Uploaded icon: {icon_filename}")
+                self.uploaded_icons.add(icon_filename)
                 return icon_filename
             else:
                 logger.warning(
@@ -208,26 +229,43 @@ class WeatherApp:
         temp: float,
         icon_filename: str,
     ) -> list:
-        """Render BusyBar display elements (text only for now).
+        """Render BusyBar display elements: icon + temperature text.
+        
+        Front display is 72x16. The icon fills the full 16px height on the
+        left (x=0..16), and text takes the remaining width on the right
+        (x=18..72, 54px). Icons are 16x16 already so no width/height needs
+        to be specified on the image element.
         
         Args:
             temp: Temperature in Fahrenheit
-            icon_filename: Icon filename (unused, for future image support)
+            icon_filename: Filename of the icon already uploaded to the device
             
         Returns:
             List of BusyBar element dicts
         """
+        text = f"{self.city_name} {temp:.0f}F" if self.show_city else f"{temp:.0f}F"
+        
         return [
             {
-                "id": "weather",
+                "id": "weather_icon",
+                "type": "image",
+                "path": icon_filename,
+                "x": 0,
+                "y": 0,
+            },
+            {
+                "id": "weather_text",
                 "type": "text",
-                "text": f"{self.city_name} {temp:.0f}F",
-                "x": 10,
-                "y": 8,
+                "text": text,
+                "x": 18,
+                "y": 5,
                 "font": "small",
                 "color": "#FFFF00FF",
-                "width": 62,
-                "scroll_rate": 0,
+                "width": 54,
+                # show_city defaults off because "Washington DC 72F" won't
+                # fit in 54px; if you turn it on, scroll so it's readable
+                # instead of getting clipped.
+                "scroll_rate": 15 if self.show_city else 0,
                 "timeout": 6,
             },
         ]
@@ -241,7 +279,7 @@ class WeatherApp:
         message = {
             "app_id": self.app_id,
             "priority": self.priority,
-            "duration_seconds": self.interval_seconds,
+            "duration_seconds": self.display_seconds,
             "timestamp": time.time(),
             "elements": elements,
         }
@@ -251,7 +289,7 @@ class WeatherApp:
         
         logger.info(
             f"Published to {self.redis_channel} "
-            f"(priority={self.priority}, duration={self.interval_seconds}s)"
+            f"(priority={self.priority}, duration={self.display_seconds}s)"
         )
     
     def run(self) -> None:
@@ -318,7 +356,26 @@ def main():
         "--interval",
         type=int,
         default=300,
-        help="Update interval in seconds (default: 300 = 5 min)",
+        help="How often to fetch weather, in seconds (default: 300 = 5 min)",
+    )
+    parser.add_argument(
+        "--display_seconds",
+        type=int,
+        default=15,
+        help=(
+            "How long weather owns the display each time it publishes, "
+            "before yielding back to idle (default: 10). Keep this well "
+            "under --interval or weather will never yield."
+        ),
+    )
+    parser.add_argument(
+        "--show_city",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Prefix display text with the city name, scrolling to fit "
+            "(default: on). Use --no-show_city for temperature only."
+        ),
     )
     parser.add_argument(
         "--redis_host",
@@ -360,12 +417,14 @@ def main():
         app_id=args.app_id,
         priority=args.priority,
         interval_seconds=args.interval,
+        display_seconds=args.display_seconds,
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         device_ip=args.device_ip,
         city_name=args.city,
         latitude=args.lat,
         longitude=args.lon,
+        show_city=args.show_city,
     )
     
     app.run()

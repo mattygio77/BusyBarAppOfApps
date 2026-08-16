@@ -162,12 +162,48 @@ class BusyBarController:
         
         logger.info("Message listener stopped")
     
+    def _clear_device(self) -> bool:
+        """Clear all display elements owned by this controller.
+
+        /api/display/draw is additive: it upserts elements by id rather
+        than replacing the whole screen. Without an explicit clear, an
+        element from the previous display owner (e.g. weather's icon)
+        stays on screen after we switch to a new owner that doesn't
+        redeclare that element id.
+
+        Returns:
+            True if successful (status 200), False otherwise.
+        """
+        try:
+            url = f"http://{self.device_ip}/api/display/draw"
+            response = requests.delete(
+                url,
+                params={"application_name": "busybar_controller"},
+                timeout=5,
+            )
+            if response.status_code == 200:
+                logger.debug("Display cleared")
+                return True
+            else:
+                logger.warning(
+                    f"Clear returned {response.status_code}: {response.text}"
+                )
+                return False
+        except Exception as e:
+            logger.error(f"Failed to clear display: {e}")
+            return False
+    
     def _draw_to_device(self, elements: list) -> bool:
         """Send display elements to BusyBar device.
+        
+        Clears any elements left over from the previous display owner
+        first, since draws are additive/upsert-by-id, not a full replace.
         
         Returns:
             True if successful (status 200), False otherwise.
         """
+        self._clear_device()
+        
         try:
             payload = {
                 "application_name": "busybar_controller",
