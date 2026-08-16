@@ -61,7 +61,7 @@ class WeatherApp:
         app_id: str,
         priority: int,
         interval_seconds: int,
-        display_seconds: int = 10,
+        stale_buffer_seconds: int = 10,
         redis_host: str = "localhost",
         redis_port: int = 6379,
         device_ip: str = "10.0.4.20",
@@ -76,10 +76,15 @@ class WeatherApp:
             app_id: Unique identifier for this app
             priority: Display priority (0-100)
             interval_seconds: How often to fetch weather from the API
-            display_seconds: How long the weather "owns" the display each
-                time it publishes, before yielding back to idle. This is
-                intentionally much shorter than interval_seconds -- weather
-                should interrupt idle briefly, not camp on top of it.
+            stale_buffer_seconds: Grace period added on top of
+                interval_seconds for the published message's duration_seconds.
+                As long as the app is alive and fetching successfully, each
+                new publish refreshes the display before the previous
+                message would expire, so weather stays up as the effective
+                "default" screen instead of blipping back to idle between
+                fetches. If the app stops publishing (crashed, killed, API
+                down past this buffer), the stale message eventually
+                expires and idle correctly takes back over.
             redis_host: Redis server host
             redis_port: Redis server port
             device_ip: BusyBar device IP (for uploading icons)
@@ -94,7 +99,7 @@ class WeatherApp:
         self.app_id = app_id
         self.priority = priority
         self.interval_seconds = interval_seconds
-        self.display_seconds = display_seconds
+        self.duration_seconds = interval_seconds + stale_buffer_seconds
         self.city_name = city_name
         self.latitude = latitude
         self.longitude = longitude
@@ -233,8 +238,9 @@ class WeatherApp:
         
         Front display is 72x16. The icon fills the full 16px height on the
         left (x=0..16), and text takes the remaining width on the right
-        (x=18..72, 54px). Icons are 16x16 already so no width/height needs
-        to be specified on the image element.
+        (x=19..72, 53px, with a 3px gap from the icon). Icons are 16x16
+        already so no width/height needs to be specified on the image
+        element.
         
         Args:
             temp: Temperature in Fahrenheit
@@ -244,30 +250,41 @@ class WeatherApp:
             List of BusyBar element dicts
         """
         text = f"{self.city_name} {temp:.0f}F" if self.show_city else f"{temp:.0f}F"
-        
+
+
         return [
             {
-                "id": "weather_icon",
+                "id": "icon",
                 "type": "image",
                 "path": icon_filename,
                 "x": 0,
                 "y": 0,
+                "display": "front"
             },
             {
-                "id": "weather_text",
+                "id": "city",
                 "type": "text",
-                "text": text,
+                "text": self.city_name,
                 "x": 18,
-                "y": 5,
+                "y": 0,
                 "font": "small",
+                "color": "#FFFFFFFF",
+                "width": 54,
+                "display": "front",
+                "scroll_rate": 500
+            },
+            {
+                "id": "temp",
+                "type": "text",
+                "text": f"{temp}°F",
+                "x": 18,
+                "y": 6,
+                "font": "normal",
                 "color": "#FFFF00FF",
                 "width": 54,
-                # show_city defaults off because "Washington DC 72F" won't
-                # fit in 54px; if you turn it on, scroll so it's readable
-                # instead of getting clipped.
-                "scroll_rate": 15 if self.show_city else 0,
-                "timeout": 6,
-            },
+                "scroll_rate": 60,
+                "display": "front"
+            }
         ]
     
     def publish_to_redis(self, elements: list) -> None:
@@ -279,7 +296,7 @@ class WeatherApp:
         message = {
             "app_id": self.app_id,
             "priority": self.priority,
-            "duration_seconds": self.display_seconds,
+            "duration_seconds": self.duration_seconds,
             "timestamp": time.time(),
             "elements": elements,
         }
@@ -289,7 +306,7 @@ class WeatherApp:
         
         logger.info(
             f"Published to {self.redis_channel} "
-            f"(priority={self.priority}, duration={self.display_seconds}s)"
+            f"(priority={self.priority}, duration={self.duration_seconds}s)"
         )
     
     def run(self) -> None:
@@ -359,13 +376,17 @@ def main():
         help="How often to fetch weather, in seconds (default: 300 = 5 min)",
     )
     parser.add_argument(
-        "--display_seconds",
+        "--stale_buffer",
         type=int,
-        default=15,
+        default=10,
         help=(
-            "How long weather owns the display each time it publishes, "
-            "before yielding back to idle (default: 10). Keep this well "
-            "under --interval or weather will never yield."
+            "Grace period (seconds) added on top of --interval before a "
+            "published weather display is considered stale (default: 10). "
+            "While the app is running and fetching successfully, each "
+            "publish refreshes the display before this expires, so weather "
+            "stays up as the default screen instead of blipping back to "
+            "idle between fetches. If the app stops updating for longer "
+            "than interval + this buffer, idle takes back over."
         ),
     )
     parser.add_argument(
@@ -417,7 +438,7 @@ def main():
         app_id=args.app_id,
         priority=args.priority,
         interval_seconds=args.interval,
-        display_seconds=args.display_seconds,
+        stale_buffer_seconds=args.stale_buffer,
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         device_ip=args.device_ip,
