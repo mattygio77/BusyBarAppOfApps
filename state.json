@@ -1,14 +1,14 @@
 {
   "current_owner": {
     "app_id": "weather",
-    "since": 1786907745.821899
+    "since": 1786924177.485179
   },
   "queue": [
     {
       "app_id": "weather",
       "priority": 50,
-      "expires_at": 1786907758.7543008,
-      "queued_at": 1786907745.7543008
+      "expires_at": 1786924487.0797231,
+      "queued_at": 1786924177.0797231
     }
   ],
   "last_display": null

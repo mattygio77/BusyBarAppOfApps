@@ -65,9 +65,9 @@ class WeatherApp:
         redis_host: str = "localhost",
         redis_port: int = 6379,
         device_ip: str = "10.0.4.20",
-        city_name: str = "Washington DC",
-        latitude: float = 38.9072,
-        longitude: float = -77.0369,
+        city_name: str = "Reston, VA",
+        latitude: float = 38.935094,
+        longitude: float = -77.366724,
         show_city: bool = True,
     ):
         """Initialize weather app.
@@ -416,19 +416,19 @@ def main():
     )
     parser.add_argument(
         "--city",
-        default="Washington DC",
+        default="Reston, VA",
         help="City name to display (default: Washington DC)",
     )
     parser.add_argument(
         "--lat",
         type=float,
-        default=38.9072,
+        default=38.935094,
         help="Latitude (default: DC)",
     )
     parser.add_argument(
         "--lon",
         type=float,
-        default=-77.0369,
+        default=-77.366724,
         help="Longitude (default: DC)",
     )
     

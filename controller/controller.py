@@ -10,7 +10,9 @@ from typing import Optional, Dict, Any
 from threading import Thread, Event
 
 import redis
-import requests
+
+from busylib import BusyBar
+from busylib.exceptions import BusyBarError
 
 from .message import DisplayMessage
 from .display_queue import DisplayQueue
@@ -22,6 +24,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# application_name the controller uses when talking to the device. All
+# elements drawn under this name are what _clear_device removes.
+APPLICATION_NAME = "busybar_controller"
 
 
 class BusyBarController:
@@ -52,6 +58,11 @@ class BusyBarController:
         
         self.redis_client: Optional[redis.Redis] = None
         self.redis_process: Optional[subprocess.Popen] = None
+        
+        # BusyBar device client (busylib). One long-lived client reused for
+        # every draw/clear call instead of opening a new connection per
+        # request.
+        self.busybar = BusyBar(self.device_ip, timeout=5.0)
         
         self.display_queue = DisplayQueue()
         self.shutdown_event = Event()
@@ -162,67 +173,30 @@ class BusyBarController:
         
         logger.info("Message listener stopped")
     
-    def _clear_device(self) -> bool:
-        """Clear all display elements owned by this controller.
-
-        /api/display/draw is additive: it upserts elements by id rather
-        than replacing the whole screen. Without an explicit clear, an
-        element from the previous display owner (e.g. weather's icon)
-        stays on screen after we switch to a new owner that doesn't
-        redeclare that element id.
-
-        Returns:
-            True if successful (status 200), False otherwise.
-        """
-        try:
-            url = f"http://{self.device_ip}/api/display/draw"
-            response = requests.delete(
-                url,
-                params={"application_name": "busybar_controller"},
-                timeout=5,
-            )
-            if response.status_code == 200:
-                logger.debug("Display cleared")
-                return True
-            else:
-                logger.warning(
-                    f"Clear returned {response.status_code}: {response.text}"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"Failed to clear display: {e}")
-            return False
-    
     def _draw_to_device(self, elements: list) -> bool:
         """Send display elements to BusyBar device.
         
         Clears any elements left over from the previous display owner
         first, since draws are additive/upsert-by-id, not a full replace.
+        The clear is best-effort: if it fails we still attempt the draw
+        rather than bailing out entirely (mirrors the previous behavior
+        of calling _clear_device() and ignoring its return value).
         
         Returns:
-            True if successful (status 200), False otherwise.
+            True if successful, False otherwise.
         """
-        self._clear_device()
         
         try:
-            payload = {
-                "application_name": "busybar_controller",
+            self.busybar.display_draw({
+                "application_name": APPLICATION_NAME,
                 "elements": elements,
-            }
-            
-            url = f"http://{self.device_ip}/api/display/draw"
-            response = requests.post(url, json=payload, timeout=5)
-            
-            if response.status_code == 200:
-                logger.debug(f"Display updated ({len(elements)} elements)")
-                return True
-            else:
-                logger.warning(
-                    f"Display returned {response.status_code}: {response.text}"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"Failed to draw to device: {e}")
+                }, 
+                clear_before_draw=True
+            )
+            logger.debug(f"Display updated ({len(elements)} elements)")
+            return True
+        except BusyBarError as e:
+            logger.warning(f"Failed to draw to device: {e}")
             return False
     
     def _get_idle_message(self) -> DisplayMessage:
@@ -344,6 +318,8 @@ class BusyBarController:
                 self.redis_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.redis_process.kill()
+        
+        self.busybar.close()
         
         self.config_manager.save_state(self.state)
         logger.info("Controller stopped")
