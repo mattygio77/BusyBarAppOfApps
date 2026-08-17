@@ -20,11 +20,18 @@ from pathlib import Path
 import redis
 import requests
 
+from busylib import BusyBar
+from busylib.exceptions import BusyBarAPIError, BusyBarError
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] weather_app: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# application_name the controller draws under; icons are uploaded under the
+# same name so the controller can find them when rendering display elements.
+APPLICATION_NAME = "busybar_controller"
 
 
 # Weather code to icon filename mapping (Open-Meteo codes)
@@ -65,9 +72,9 @@ class WeatherApp:
         redis_host: str = "localhost",
         redis_port: int = 6379,
         device_ip: str = "10.0.4.20",
-        city_name: str = "Reston, VA",
-        latitude: float = 38.935094,
-        longitude: float = -77.366724,
+        city_name: str = "Washington DC",
+        latitude: float = 38.9072,
+        longitude: float = -77.0369,
         show_city: bool = True,
     ):
         """Initialize weather app.
@@ -113,6 +120,10 @@ class WeatherApp:
             decode_responses=True,
         )
         self.redis_channel = f"busybar:app:{app_id}"
+        
+        # BusyBar device client (busylib), reused across icon uploads
+        # instead of making a fresh HTTP connection per upload.
+        self.busybar = BusyBar(device_ip)
         
         # Icon folder (same directory as this script)
         self.icon_folder = Path(__file__).parent / "weather" / "icons"
@@ -177,7 +188,10 @@ class WeatherApp:
     def upload_icon_to_device(self, icon_filename: str) -> str:
         """Upload icon to device and return path for display.
         
-        Uploads from local /weather/icons/ folder to device.
+        Uploads from local /weather/icons/ folder to device via busylib's
+        assets_upload, which POSTs the raw bytes to /api/assets/upload
+        under APPLICATION_NAME (so the controller can find icons when it
+        later references this filename in a display element's "path").
         
         Args:
             icon_filename: Filename (e.g., "sun.png")
@@ -201,31 +215,21 @@ class WeatherApp:
                 icon_data = f.read()
             
             # Upload to device (use busybar_controller app name so controller can find icons)
-            url = (
-                f"http://{self.device_ip}/api/assets/upload"
-                f"?application_name=busybar_controller"
-                f"&file={icon_filename}"
-            )
-            
-            response = requests.post(
-                url,
+            self.busybar.assets_upload(
+                application_name=APPLICATION_NAME,
+                filename=icon_filename,
                 data=icon_data,
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=5,
             )
             
-            if response.status_code == 200:
-                logger.debug(f"Uploaded icon: {icon_filename}")
-                self.uploaded_icons.add(icon_filename)
-                return icon_filename
-            else:
-                logger.warning(
-                    f"Failed to upload icon {icon_filename}: "
-                    f"{response.status_code} {response.text}"
-                )
-                return icon_filename  # Try anyway, device might have it cached
+            logger.debug(f"Uploaded icon: {icon_filename}")
+            self.uploaded_icons.add(icon_filename)
+            return icon_filename
         
-        except Exception as e:
+        except BusyBarAPIError as e:
+            logger.warning(f"Failed to upload icon {icon_filename}: {e}")
+            return icon_filename  # Try anyway, device might have it cached
+        
+        except BusyBarError as e:
             logger.error(f"Error uploading icon {icon_filename}: {e}")
             return icon_filename  # Try anyway
     
@@ -326,29 +330,32 @@ class WeatherApp:
             return
         
         # Main loop
-        while not self.shutdown:
-            try:
-                # Fetch weather
-                temp, code = self.fetch_weather()
+        try:
+            while not self.shutdown:
+                try:
+                    # Fetch weather
+                    temp, code = self.fetch_weather()
+                    
+                    # Get and upload icon
+                    icon_filename = self.get_icon_path(code)
+                    icon_path = self.upload_icon_to_device(icon_filename)
+                    
+                    # Render elements
+                    elements = self.render_elements(temp, icon_path)
+                    
+                    # Publish to Redis
+                    self.publish_to_redis(elements)
                 
-                # Get and upload icon
-                icon_filename = self.get_icon_path(code)
-                icon_path = self.upload_icon_to_device(icon_filename)
+                except Exception as e:
+                    logger.error(f"Error in publish loop: {e}")
                 
-                # Render elements
-                elements = self.render_elements(temp, icon_path)
-                
-                # Publish to Redis
-                self.publish_to_redis(elements)
-            
-            except Exception as e:
-                logger.error(f"Error in publish loop: {e}")
-            
-            # Wait for next update (check shutdown frequently, every 100ms)
-            for _ in range(int(self.interval_seconds * 10)):
-                if self.shutdown:
-                    break
-                time.sleep(0.1)
+                # Wait for next update (check shutdown frequently, every 100ms)
+                for _ in range(int(self.interval_seconds * 10)):
+                    if self.shutdown:
+                        break
+                    time.sleep(0.1)
+        finally:
+            self.busybar.close()
         
         logger.info("Weather app stopped")
 
