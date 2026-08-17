@@ -74,6 +74,10 @@ class BusyBarController:
         self.idle_index = 0
         self.last_idle_rotation = time.time()
         self.idle_cycle = self.idle_config.get("cycle_seconds", 10)
+        # Cached idle DisplayMessage. Only rebuilt when idle content actually
+        # rotates, so its identity (app_id, timestamp) stays stable between
+        # rotations - see _get_idle_message().
+        self._idle_message: Optional[DisplayMessage] = None
     
     def _ensure_redis(self) -> None:
         """Check if Redis is running; if not, start it."""
@@ -173,6 +177,26 @@ class BusyBarController:
         
         logger.info("Message listener stopped")
     
+    def _clear_device(self) -> bool:
+        """Clear all display elements owned by this controller.
+
+        /api/display/draw is additive: it upserts elements by id rather
+        than replacing the whole screen. Without an explicit clear, an
+        element from the previous display owner (e.g. weather's icon)
+        stays on screen after we switch to a new owner that doesn't
+        redeclare that element id.
+
+        Returns:
+            True if successful, False otherwise.
+        """
+        try:
+            self.busybar.display_clear(application_name=APPLICATION_NAME)
+            logger.debug("Display cleared")
+            return True
+        except BusyBarError as e:
+            logger.warning(f"Failed to clear display: {e}")
+            return False
+    
     def _draw_to_device(self, elements: list) -> bool:
         """Send display elements to BusyBar device.
         
@@ -200,20 +224,29 @@ class BusyBarController:
             return False
     
     def _get_idle_message(self) -> DisplayMessage:
-        """Get next idle message to display.
+        """Get the current idle message to display.
         
-        Rotates through idle_content at idle_cycle rate.
+        Rotates through idle_content at idle_cycle rate. Returns the same
+        cached DisplayMessage instance between rotations - a fresh instance
+        (with a fresh timestamp) is only built when the idle content
+        actually changes, so the main loop's identity check doesn't fire a
+        needless redraw every tick while idle content is unchanged.
         """
         current_time = time.time()
         
         # Check if it's time to rotate
+        rotated = False
         if (current_time - self.last_idle_rotation) > self.idle_cycle:
             self.idle_index = (self.idle_index + 1) % max(len(self.idle_content), 1)
             self.last_idle_rotation = current_time
+            rotated = True
         
-        # If no idle content, return a default message
+        if self._idle_message is not None and not rotated:
+            return self._idle_message
+        
+        # If no idle content, use a default message
         if not self.idle_content:
-            return DisplayMessage(
+            self._idle_message = DisplayMessage(
                 app_id="idle",
                 priority=0,
                 duration_seconds=999999,
@@ -232,14 +265,16 @@ class BusyBarController:
                     }
                 ],
             )
+        else:
+            content = self.idle_content[self.idle_index]
+            self._idle_message = DisplayMessage(
+                app_id="idle",
+                priority=0,
+                duration_seconds=999999,
+                elements=[content],
+            )
         
-        content = self.idle_content[self.idle_index]
-        return DisplayMessage(
-            app_id="idle",
-            priority=0,
-            duration_seconds=999999,
-            elements=[content],
-        )
+        return self._idle_message
     
     def start(self) -> None:
         """Main event loop."""
@@ -260,33 +295,61 @@ class BusyBarController:
         
         logger.info("Controller ready, entering main loop...")
         
+        # Identity of what's currently drawn on the device: (app_id,
+        # message timestamp). Comparing on the message's own timestamp,
+        # not just app_id, is what lets an app that's already the display
+        # owner push an updated draw (e.g. weather's temperature ticking
+        # over) instead of being silently ignored because its app_id
+        # hasn't changed.
+        current_display_key: Optional[tuple] = None
         current_display_owner: Optional[str] = None
+        current_owner_since: Optional[float] = None
         
         try:
             while not self.shutdown_event.is_set():
                 current_time = time.time()
                 
-                # Get current display owner (highest priority, not expired)
+                # Get current display owner: highest priority message,
+                # guaranteed its own duration_seconds of screen time unless
+                # boot off by something strictly higher priority.
                 current_msg = self.display_queue.get_current(current_time)
                 
                 # If no app owns display, show idle content
                 if current_msg is None:
                     current_msg = self._get_idle_message()
                 
-                # Draw if changed
-                if current_msg.app_id != current_display_owner:
-                    logger.info(
-                        f"Display ownership: {current_display_owner} → "
-                        f"{current_msg.app_id} "
-                        f"(priority={current_msg.priority})"
-                    )
+                display_key = (current_msg.app_id, current_msg.timestamp)
+                
+                # Redraw whenever the message actually on screen has
+                # changed - whether that's a new app taking ownership or
+                # the same app pushing fresh content while it still owns
+                # the display.
+                if display_key != current_display_key:
+                    owner_changed = current_msg.app_id != current_display_owner
+                    if owner_changed:
+                        logger.info(
+                            f"Display ownership: {current_display_owner} → "
+                            f"{current_msg.app_id} "
+                            f"(priority={current_msg.priority})"
+                        )
+                        current_owner_since = current_time
+                    else:
+                        logger.debug(
+                            f"Refreshing display content for "
+                            f"{current_msg.app_id} "
+                            f"(priority={current_msg.priority})"
+                        )
+                    
                     self._draw_to_device(current_msg.elements)
+                    current_display_key = display_key
                     current_display_owner = current_msg.app_id
                     
                     # Update state
                     self.state["current_owner"] = {
                         "app_id": current_msg.app_id,
-                        "since": current_time,
+                        "priority": current_msg.priority,
+                        "since": current_owner_since,
+                        "expires_at": current_owner_since + current_msg.duration_seconds,
                     }
                     self.state["queue"] = self.display_queue.get_queue_snapshot(
                         current_time

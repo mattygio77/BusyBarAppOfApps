@@ -13,7 +13,11 @@ class DisplayMessage:
     Attributes:
         app_id: Unique identifier for the publishing app
         priority: 0-100, higher = more urgent
-        duration_seconds: How long this message "owns" the display if it wins
+        duration_seconds: How long this message should own the display once
+            it becomes the display owner (see DisplayQueue). Also bounds how
+            long the message is willing to sit in the queue waiting for its
+            turn: if it never becomes the owner within duration_seconds of
+            being published, it's dropped as stale (see is_expired).
         elements: List of BusyBar display elements (JSON-compatible dicts)
         timestamp: When the message was published (Unix timestamp)
     """
@@ -48,7 +52,15 @@ class DisplayMessage:
                 raise ValueError(f"Unknown element type: {elem['type']}")
     
     def is_expired(self, current_time: float = None) -> bool:
-        """Check if message has exceeded its duration."""
+        """Check if this message has been waiting too long for its turn.
+        
+        Only meaningful for a message that has NOT yet become the display
+        owner: it caps how long a queued/waiting message may sit before
+        it's assumed stale and dropped. Once a message *is* the display
+        owner, its on-screen lifetime is governed by DisplayQueue's
+        ownership clock (time since it was granted the display), not this
+        publish-time check.
+        """
         if current_time is None:
             current_time = time.time()
         return (current_time - self.timestamp) > self.duration_seconds
