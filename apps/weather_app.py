@@ -59,6 +59,15 @@ WEATHER_ICON_MAP = {
     99: "rain.png",
 }
 
+# Night-time icon overrides. Only conditions whose daytime icon depicts the
+# sun need a swap after dark (clear / mainly clear / partly cloudy); cloud,
+# fog, rain, and snow icons don't show the sun so they look correct at any
+# hour and are left alone.
+NIGHT_ICON_MAP = {
+    "sun.png": "moon.png",
+    "partly.png": "moon.png",
+}
+
 
 class WeatherApp:
     """Fetches weather and publishes to Redis for the controller."""
@@ -148,7 +157,11 @@ class WeatherApp:
         """Fetch weather from Open-Meteo API.
         
         Returns:
-            (temperature, weather_code) tuple
+            (temperature, weather_code, is_day) tuple. is_day is Open-Meteo's
+            own day/night flag for the request's lat/lon (True for day,
+            False for night) - it's an astronomical calculation based on
+            sunrise/sunset at that location, not just a fixed local clock
+            time, so it stays correct across seasons and locations.
             
         Raises:
             Exception on API error
@@ -167,23 +180,36 @@ class WeatherApp:
             
             temp = current.get("temperature")
             code = current.get("weathercode", 0)
+            is_day = bool(current.get("is_day", 1))
             
-            logger.debug(f"Fetched weather: {temp}°F, code={code}")
-            return temp, code
+            logger.debug(
+                f"Fetched weather: {temp}°F, code={code}, "
+                f"is_day={is_day}"
+            )
+            return temp, code, is_day
         except Exception as e:
             logger.error(f"Failed to fetch weather: {e}")
             raise
     
-    def get_icon_path(self, weather_code: int) -> str:
-        """Get icon filename for weather code.
+    def get_icon_path(self, weather_code: int, is_day: bool = True) -> str:
+        """Get icon filename for weather code, day or night.
         
         Args:
             weather_code: Open-Meteo weather code
+            is_day: Whether it's currently daytime at the location. When
+                False, the daytime icon is looked up first and then swapped
+                via NIGHT_ICON_MAP if a night equivalent exists (e.g.
+                "sun.png" -> "moon.png"). Conditions without a sun in their
+                icon (cloud/fog/rain/snow) have no entry in NIGHT_ICON_MAP
+                and pass through unchanged.
             
         Returns:
-            Icon filename (e.g., "sun.png")
+            Icon filename (e.g., "sun.png", "moon.png")
         """
-        return WEATHER_ICON_MAP.get(weather_code, "sun.png")
+        icon = WEATHER_ICON_MAP.get(weather_code, "sun.png")
+        if not is_day:
+            icon = NIGHT_ICON_MAP.get(icon, icon)
+        return icon
     
     def upload_icon_to_device(self, icon_filename: str) -> str:
         """Upload icon to device and return path for display.
@@ -334,10 +360,10 @@ class WeatherApp:
             while not self.shutdown:
                 try:
                     # Fetch weather
-                    temp, code = self.fetch_weather()
+                    temp, code, is_day = self.fetch_weather()
                     
-                    # Get and upload icon
-                    icon_filename = self.get_icon_path(code)
+                    # Get and upload icon (day/night aware)
+                    icon_filename = self.get_icon_path(code, is_day)
                     icon_path = self.upload_icon_to_device(icon_filename)
                     
                     # Render elements
