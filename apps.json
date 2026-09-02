@@ -10,6 +10,14 @@
       "proposed_interval_seconds": 300,
       "override_interval_seconds": null,
       "default_priority": 50
+    },
+    {
+      "id": "stocks",
+      "path": "./apps/stock_app.py",
+      "enabled": true,
+      "proposed_interval_seconds": 60,
+      "override_interval_seconds": null,
+      "default_priority": 60
     }
   ]
 }

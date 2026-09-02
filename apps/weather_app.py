@@ -20,18 +20,13 @@ from pathlib import Path
 import redis
 import requests
 
-from busylib import BusyBar
-from busylib.exceptions import BusyBarAPIError, BusyBarError
+from icon_uploader import IconUploader
 
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] weather_app: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# application_name the controller draws under; icons are uploaded under the
-# same name so the controller can find them when rendering display elements.
-APPLICATION_NAME = "busybar_controller"
 
 
 # Weather code to icon filename mapping (Open-Meteo codes)
@@ -130,16 +125,13 @@ class WeatherApp:
         )
         self.redis_channel = f"busybar:app:{app_id}"
         
-        # BusyBar device client (busylib), reused across icon uploads
-        # instead of making a fresh HTTP connection per upload.
-        self.busybar = BusyBar(device_ip)
-        
-        # Icon folder (same directory as this script)
-        self.icon_folder = Path(__file__).parent / "weather" / "icons"
-        
-        # Icons already uploaded to the device this run, so we don't
-        # re-upload the same PNG every single fetch cycle.
-        self.uploaded_icons = set()
+        # BusyBar device client, wrapped in the shared IconUploader (used
+        # by every sub-app that needs to push local icon PNGs to the
+        # device before the controller can reference them by filename).
+        self.icon_uploader = IconUploader(
+            device_ip,
+            icon_folder=Path(__file__).parent / "weather" / "icons",
+        )
         
         # Shutdown flag
         self.shutdown = False
@@ -211,53 +203,6 @@ class WeatherApp:
             icon = NIGHT_ICON_MAP.get(icon, icon)
         return icon
     
-    def upload_icon_to_device(self, icon_filename: str) -> str:
-        """Upload icon to device and return path for display.
-        
-        Uploads from local /weather/icons/ folder to device via busylib's
-        assets_upload, which POSTs the raw bytes to /api/assets/upload
-        under APPLICATION_NAME (so the controller can find icons when it
-        later references this filename in a display element's "path").
-        
-        Args:
-            icon_filename: Filename (e.g., "sun.png")
-            
-        Returns:
-            Path to use in display elements (e.g., "sun.png")
-        """
-        # Skip re-uploading an icon we already pushed to the device this run.
-        if icon_filename in self.uploaded_icons:
-            return icon_filename
-        
-        local_path = self.icon_folder / icon_filename
-        
-        if not local_path.exists():
-            logger.error(f"Icon not found: {local_path}")
-            return "sun.png"  # Fallback
-        
-        try:
-            # Read icon bytes
-            with open(local_path, "rb") as f:
-                icon_data = f.read()
-            
-            # Upload to device (use busybar_controller app name so controller can find icons)
-            self.busybar.assets_upload(
-                application_name=APPLICATION_NAME,
-                filename=icon_filename,
-                data=icon_data,
-            )
-            
-            logger.debug(f"Uploaded icon: {icon_filename}")
-            self.uploaded_icons.add(icon_filename)
-            return icon_filename
-        
-        except BusyBarAPIError as e:
-            logger.warning(f"Failed to upload icon {icon_filename}: {e}")
-            return icon_filename  # Try anyway, device might have it cached
-        
-        except BusyBarError as e:
-            logger.error(f"Error uploading icon {icon_filename}: {e}")
-            return icon_filename  # Try anyway
     
     def render_elements(
         self,
@@ -364,7 +309,9 @@ class WeatherApp:
                     
                     # Get and upload icon (day/night aware)
                     icon_filename = self.get_icon_path(code, is_day)
-                    icon_path = self.upload_icon_to_device(icon_filename)
+                    icon_path = self.icon_uploader.upload(
+                        icon_filename, fallback="sun.png"
+                    )
                     
                     # Render elements
                     elements = self.render_elements(temp, icon_path)
@@ -381,7 +328,7 @@ class WeatherApp:
                         break
                     time.sleep(0.1)
         finally:
-            self.busybar.close()
+            self.icon_uploader.close()
         
         logger.info("Weather app stopped")
 
