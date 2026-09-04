@@ -106,7 +106,7 @@ class StockApp:
         priority: int,
         tickers: list,
         interval_seconds: int = 60,
-        card_seconds: float = 30.0,
+        card_seconds: float = 4.0,
         stale_buffer_seconds: int = 3,
         active_seconds: float = None,
         rest_seconds: float = 25.0,
@@ -129,7 +129,7 @@ class StockApp:
             interval_seconds: How often to refetch prices from Yahoo
                 Finance for every configured ticker
             card_seconds: How long each ticker's card stays on screen
-                before advancing to the next (default: 30.0)
+                before advancing to the next (default: 4.0)
             stale_buffer_seconds: Grace period added on top of
                 card_seconds for each published card's duration_seconds -
                 same purpose as in weather_app.py: keeps a card as the
@@ -497,7 +497,7 @@ def main():
     )
     parser.add_argument(
         "--tickers",
-        default="VOO,VTI,AAPL,MSFT,GOOGL,AMZN",
+        default="AAPL,MSFT,GOOGL,AMZN",
         help=(
             "Comma-separated ticker symbols to cycle through "
             "(default: AAPL,MSFT,GOOGL,AMZN)"
@@ -512,10 +512,10 @@ def main():
     parser.add_argument(
         "--card_seconds",
         type=float,
-        default=30.0,
+        default=4.0,
         help=(
             "How long each ticker's card stays on screen before advancing "
-            "to the next (default: 30.0)"
+            "to the next (default: 4.0)"
         ),
     )
     parser.add_argument(
