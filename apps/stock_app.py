@@ -1,24 +1,43 @@
 #!/usr/bin/env python3
-"""Stocks ticker-tape sub-app for BusyBar controller.
+"""Stocks sub-app for BusyBar controller.
 
 Fetches the day's percent change for a configured list of stock tickers
-and publishes a continuously scrolling ticker-tape display to Redis.
+and publishes a display card - one ticker at a time - to Redis, cycling
+to the next ticker every --card_seconds, wrapping back to the first after
+the last.
 
-Each ticker renders as: [up/down arrow icon] [TICKER] / [+X.XX%] - the
-ticker name in a larger font than the percent, and the percent (and arrow)
-colored green for a gain or red for a loss. The whole tape scrolls
-right-to-left across the front display and loops seamlessly once the last
-configured ticker has scrolled past, wrapping back to the first.
+Each card is: [up/down arrow icon] [TICKER] / [+X.XX%] - the ticker name
+in a larger font than the percent, and the percent (and arrow icon) colored
+green for a gain or red for a loss.
+
+Why one full card at a time rather than a continuously-panning tape (an
+earlier version of this app tried that): busylib's ImageElement has no
+scroll fields at all - only TextElement does - so an icon genuinely cannot
+be scrolled by the device. And a TextElement's scroll_rate only reveals
+more of THAT element's own text within its own fixed x/width box; it
+doesn't move the box itself across the screen. There's no way to pan a
+multi-element assembly (icon + two colored text pieces) across the display
+using the device's native scroll - the only way to do that is to keep
+republishing every element's x position from the app itself many times a
+second, which is what caused this app to redraw far more often than it
+should have.
+
+So instead: publish one full card per ticker, once, and let it sit for the
+whole --card_seconds (duration_seconds is set to cover exactly that, so
+there's no need to republish until it's time to move to the next ticker -
+this is what actually fixes the constant-redraw problem). scroll_rate is
+still set on the ticker/percent text - correctly, for its real purpose -
+so if a ticker or percent string is ever wider than its own text box, the
+device scrolls *that piece* in place rather than clipping it, instead of
+never scrolling anything the way the old design needed it to.
 
 A note on sharing the display with weather (or anything else that's also
 designed to be an "always on" default): the controller's priority model
 only lets a STRICTLY higher priority message interrupt the current owner,
 and an app that keeps renewing itself (like weather does) never naturally
-lets go. Two apps at equal or ascending-then-flat priority would mean
-whichever grabs ownership first keeps it forever and the other never
-shows up at all. So instead of trying to be a co-equal "default" like
-weather, this app is a higher-priority *interrupter* that runs an active/
-rest duty cycle: it actively holds the display (renewing every tick) for
+lets go. So instead of trying to be a co-equal "default" like weather,
+this app is a higher-priority *interrupter* that runs an active/rest duty
+cycle: it actively holds the display, cycling through its tickers, for
 --active_seconds, then deliberately stops publishing for --rest_seconds,
 letting its own ownership guarantee lapse and handing control back to
 whatever's next (weather, most likely) - then repeats. That's why its
@@ -48,23 +67,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Icon filenames uploaded once at startup - unlike weather's per-condition
-# icons, there are only ever two possible arrows here.
+# Icon filenames uploaded once at startup - there are only ever two
+# possible arrows here.
 UP_ICON = "stock_up.png"
 DOWN_ICON = "stock_down.png"
 
-# Front display is 72x16 (see busylib's displays guide). Per-ticker
-# "segment" layout in the scrolling tape, all in pixels. Segments are laid
-# out left to right and the whole assembly is panned via each element's x
-# coordinate - the device just doesn't render whatever falls outside 0-72,
-# which is what lets a segment glide smoothly on and off screen.
-ICON_SIZE = 16          # arrow icon is 16x16, drawn at the segment's x + 0
+# Front display is 72x16 (see busylib's displays guide / DisplayName.FRONT
+# spec). Icon on the left, a two-row text column on the right - the exact
+# same geometry weather_app.py already uses successfully.
+ICON_SIZE = 16          # arrow icon is 16x16, drawn at x=0, y=0
 TEXT_X_OFFSET = 18      # 2px gap between icon and the text column
-TEXT_COL_WIDTH = 50     # width of the ticker/percent text column
-SEGMENT_GAP = 14        # blank space between one segment and the next
-SEGMENT_WIDTH = TEXT_X_OFFSET + TEXT_COL_WIDTH + SEGMENT_GAP  # 82px/ticker
-
-FRONT_WIDTH = 72        # from busylib's DisplayName.FRONT spec
+TEXT_COL_WIDTH = 54     # 18 + 54 = 72, exactly fills the remaining width
+FRONT_WIDTH = 72
 
 TICKER_COLOR = "#FFFFFFFF"   # neutral white for the ticker name
 UP_COLOR = "#00FF00FF"       # green percent text + arrow, for gains
@@ -84,7 +98,7 @@ YAHOO_HEADERS = {
 
 
 class StockApp:
-    """Fetches daily stock movement and publishes a scrolling ticker tape."""
+    """Fetches daily stock movement and publishes one ticker card at a time."""
 
     def __init__(
         self,
@@ -92,10 +106,9 @@ class StockApp:
         priority: int,
         tickers: list,
         interval_seconds: int = 60,
-        scroll_speed: float = 14.0,
-        tick_seconds: float = 0.4,
+        card_seconds: float = 30.0,
         stale_buffer_seconds: int = 3,
-        active_seconds: float = 25.0,
+        active_seconds: float = None,
         rest_seconds: float = 25.0,
         redis_host: str = "localhost",
         redis_port: int = 6379,
@@ -108,37 +121,31 @@ class StockApp:
             priority: Display priority 0-100. Should be set STRICTLY
                 higher than any other "always on" default app (weather
                 defaults to 50, so this defaults to 60) - see the duty
-                cycle note below and in the module docstring for why.
+                cycle note in the module docstring for why.
             tickers: List of ticker symbols to cycle through, e.g.
                 ["AAPL", "MSFT", "GOOGL"]. Configuring which stocks show up
                 is just this list - add or remove tickers here (or via
                 --tickers on the command line).
             interval_seconds: How often to refetch prices from Yahoo
                 Finance for every configured ticker
-            scroll_speed: Ticker-tape scroll speed, in pixels/second
-            tick_seconds: How often to advance the scroll animation and
-                republish to Redis. The controller's main loop only checks
-                for new content twice a second (see controller.py's
-                time.sleep(0.5)), so pushing much faster than that just
-                means intermediate frames get skipped rather than drawn -
-                0.4s keeps this comfortably ahead of that without wasting
-                Redis traffic on frames that would never make it to the
-                device.
+            card_seconds: How long each ticker's card stays on screen
+                before advancing to the next (default: 30.0)
             stale_buffer_seconds: Grace period added on top of
-                tick_seconds for each published message's duration_seconds -
-                same purpose as in weather_app.py: keeps the tape as the
-                display owner for as long as this app is actively
-                publishing, and lets its ownership lapse quickly (rather
-                than freezing on screen) once it stops.
-            active_seconds: How long each active window lasts - the app
-                renews itself every tick for this long, holding the
-                display, before deliberately going quiet.
+                card_seconds for each published card's duration_seconds -
+                same purpose as in weather_app.py: keeps a card as the
+                display owner for its whole dwell time without needing to
+                republish, and lets ownership lapse quickly (rather than
+                freezing on screen) if this app stops updating.
+            active_seconds: How long each active window lasts before this
+                app deliberately goes quiet. If None (default), it's set
+                to exactly one full lap through every configured ticker
+                (card_seconds * number of tickers).
             rest_seconds: How long to stay quiet between active windows.
                 During this time the app doesn't publish at all, so its
-                ownership guarantee lapses (after stale_buffer_seconds or
-                so) and whatever's next-highest-priority - normally
-                weather - gets the display back. After resting, the app
-                starts a fresh active window from the first ticker.
+                ownership guarantee lapses and whatever's next-highest-
+                priority - normally weather - gets the display back. After
+                resting, the app starts a fresh active window from the
+                first ticker.
             redis_host: Redis server host
             redis_port: Redis server port
             device_ip: BusyBar device IP (for uploading the arrow icons)
@@ -150,18 +157,27 @@ class StockApp:
             raise ValueError("At least one ticker must be configured")
 
         self.interval_seconds = interval_seconds
-        self.scroll_speed = scroll_speed
-        self.tick_seconds = tick_seconds
+        self.card_seconds = card_seconds
         # duration_seconds must be a positive int (see DisplayMessage), so
-        # round the tick up before adding the stale-buffer on top.
-        self.duration_seconds = math.ceil(tick_seconds) + stale_buffer_seconds
+        # round the card length up before adding the stale-buffer on top.
+        self.duration_seconds = math.ceil(card_seconds) + stale_buffer_seconds
 
-        self.active_seconds = active_seconds
+        self.active_seconds = (
+            active_seconds
+            if active_seconds is not None
+            else card_seconds * len(self.tickers)
+        )
         self.rest_seconds = rest_seconds
-        # Duty-cycle state: "active" (renewing/publishing, holding the
+        # Duty-cycle state: "active" (cycling through cards, holding the
         # display) or "resting" (deliberately silent, letting go of it).
         self.cycle_state = "active"
         self.cycle_started_at = 0.0
+
+        # Which configured ticker (by index into the *available* list -
+        # see _current_ticker()) is currently on screen, and when its card
+        # was last (re)published.
+        self.card_index = 0
+        self.card_started_at = 0.0
 
         # Redis client
         self.redis_client = redis.Redis(
@@ -181,13 +197,9 @@ class StockApp:
 
         # ticker -> (price, previous_close) from the most recent successful
         # fetch. A ticker that has never successfully fetched is left out
-        # of the tape until it does; one that fails on a later refresh
+        # of the rotation until it does; one that fails on a later refresh
         # keeps showing its last known value rather than dropping out.
         self.quotes = {}
-
-        # Running scroll offset, in pixels. Advanced every tick and wrapped
-        # modulo the current tape width (see run() and build_frame()).
-        self.scroll_position = 0.0
         self.last_fetch = 0.0
 
         self.shutdown = False
@@ -242,7 +254,7 @@ class StockApp:
 
         A single ticker failing doesn't take down the rest - it logs a
         warning and keeps showing that ticker's last known value (or
-        leaves it out of the tape entirely if it has never succeeded).
+        leaves it out of the rotation entirely if it has never succeeded).
         """
         for ticker in self.tickers:
             try:
@@ -256,13 +268,21 @@ class StockApp:
             # Be polite to Yahoo's unofficial endpoint between requests.
             time.sleep(0.3)
 
-    def _segment_elements(self, ticker: str, seg_x: int) -> list:
-        """Build the icon + ticker + percent elements for one segment.
+    def _available_tickers(self) -> list:
+        """Configured tickers that have at least one successful fetch."""
+        return [t for t in self.tickers if t in self.quotes]
 
-        seg_x is this segment's current on-screen x position and may be
-        negative or beyond FRONT_WIDTH - the device simply won't render
-        whatever falls outside the display, which is what lets a segment
-        scroll smoothly on and off screen.
+    def _card_elements(self, ticker: str) -> list:
+        """Build the full-screen icon + ticker + percent card for one
+        ticker.
+
+        Row split (small font at y=0, normal font at y=6) matches
+        weather_app.py's proven, non-clipping layout exactly - an earlier
+        version of this app put the bigger ("normal") font in the top row
+        with a vertically-centering "align", which clipped its top edge
+        against the display's top boundary. "top_left" alignment plus
+        reusing weather's exact y values avoids both problems: text is
+        anchored at y and grows downward rather than being centered on it.
         """
         price, previous_close = self.quotes[ticker]
         pct_change = (price - previous_close) / previous_close * 100
@@ -272,54 +292,54 @@ class StockApp:
 
         return [
             {
-                "id": f"{ticker}_icon",
+                "id": "stock_icon",
                 "type": "image",
                 "path": icon,
-                "x": seg_x,
+                "x": 0,
                 "y": 0,
                 "display": "front",
             },
             {
-                # Ticker name: bigger font ("normal"), neutral color -
-                # only the percent below is green/red.
-                "id": f"{ticker}_name",
-                "type": "text",
-                "text": ticker,
-                "x": seg_x + TEXT_X_OFFSET,
-                "y": 0,
-                "font": "normal",
-                "color": TICKER_COLOR,
-                "width": TEXT_COL_WIDTH,
-                "align": "mid_left",
-                # We pan the whole segment ourselves via x each tick, so
-                # the device's own per-element scroll must stay off -
-                # otherwise the text would drift independently of the
-                # icon it's supposed to stay lined up with.
-                "scroll_rate": 0,
-                "scroll_start_delay": 0,
-                "scroll_repeat_delay": 0,
-                "display": "front",
-            },
-            {
-                # Percent change: smaller font ("small"), green/red.
-                "id": f"{ticker}_pct",
+                # Percent change: top row, smaller font, green/red.
+                "id": "stock_pct",
                 "type": "text",
                 "text": f"{pct_change:+.2f}%",
-                "x": seg_x + TEXT_X_OFFSET,
-                "y": 6,
+                "x": TEXT_X_OFFSET,
+                "y": 0,
                 "font": "small",
                 "color": color,
                 "width": TEXT_COL_WIDTH,
-                "align": "mid_left",
-                "scroll_rate": 0,
-                "scroll_start_delay": 0,
-                "scroll_repeat_delay": 0,
+                "align": "top_left",
+                # Only matters if this string is ever wider than
+                # TEXT_COL_WIDTH - the device scrolls it in place rather
+                # than clipping it. Values match weather_app.py's city
+                # text.
+                "scroll_rate": 500,
+                "scroll_start_delay": 1000,
+                "scroll_repeat_delay": 1000,
+                "display": "front",
+            },
+            {
+                # Ticker name: bottom row, bigger font, neutral color -
+                # only the percent above is green/red.
+                "id": "stock_name",
+                "type": "text",
+                "text": ticker,
+                "x": TEXT_X_OFFSET,
+                "y": 6,
+                "font": "normal",
+                "color": TICKER_COLOR,
+                "width": TEXT_COL_WIDTH,
+                "align": "top_left",
+                "scroll_rate": 500,
+                "scroll_start_delay": 1000,
+                "scroll_repeat_delay": 1000,
                 "display": "front",
             },
         ]
 
     def _loading_message(self) -> list:
-        """Fallback frame shown before the first successful fetch."""
+        """Fallback card shown before the first successful fetch."""
         return [
             {
                 "id": "stocks_loading",
@@ -330,40 +350,39 @@ class StockApp:
                 "font": "small",
                 "color": "#FFFFFFFF",
                 "width": FRONT_WIDTH,
+                "align": "top_left",
                 "scroll_rate": 0,
                 "display": "front",
             }
         ]
 
-    def build_frame(self) -> list:
-        """Build the list of display elements visible at the current
-        scroll position, wrapping seamlessly once the last ticker's
-        segment has scrolled past.
-        """
-        available = [t for t in self.tickers if t in self.quotes]
+    def _current_card_elements(self) -> list:
+        """Elements for whichever ticker card.card_index points at."""
+        available = self._available_tickers()
         if not available:
             return self._loading_message()
+        ticker = available[self.card_index % len(available)]
+        return self._card_elements(ticker)
 
-        total_width = SEGMENT_WIDTH * len(available)
+    def publish_current_card(self) -> None:
+        """Publish (once) whichever ticker card is currently selected."""
+        try:
+            self.publish_to_redis(self._current_card_elements())
+        except Exception as e:
+            logger.error(f"Error publishing card: {e}")
 
-        elements = []
-        for i, ticker in enumerate(available):
-            base_x = i * SEGMENT_WIDTH
-            seg_x = base_x - self.scroll_position
-            # A segment that's scrolled past the left edge wraps back
-            # around to the right, so the tape loops with no visible seam.
-            if seg_x < -SEGMENT_WIDTH:
-                seg_x += total_width
-
-            if -SEGMENT_WIDTH <= seg_x <= FRONT_WIDTH:
-                elements.extend(
-                    self._segment_elements(ticker, int(round(seg_x)))
-                )
-
-        return elements or self._loading_message()
+    def advance_card(self) -> None:
+        """Move to the next ticker, wrapping back to the first after the
+        last, then publish it. A no-op (still publishes) if nothing has
+        successfully fetched yet.
+        """
+        available = self._available_tickers()
+        if available:
+            self.card_index = (self.card_index + 1) % len(available)
+        self.publish_current_card()
 
     def publish_to_redis(self, elements: list) -> None:
-        """Publish a display message (one animation frame) to Redis."""
+        """Publish a display message (one ticker card) to Redis."""
         message = {
             "app_id": self.app_id,
             "priority": self.priority,
@@ -376,18 +395,19 @@ class StockApp:
         self.redis_client.publish(self.redis_channel, msg_json)
 
         logger.debug(
-            f"Published frame to {self.redis_channel} "
+            f"Published card to {self.redis_channel} "
             f"({len(elements)} elements)"
         )
 
     def run(self) -> None:
-        """Main loop: periodically refresh quotes, continuously animate
-        and publish the scrolling ticker tape.
+        """Main loop: periodically refresh quotes, and advance/publish
+        one ticker card at a time on a much slower cadence than before -
+        once per card_seconds, not every animation tick.
         """
         logger.info(
             f"Starting stocks app: {', '.join(self.tickers)} "
             f"(refresh every {self.interval_seconds}s, "
-            f"scroll {self.scroll_speed}px/s)"
+            f"card shown for {self.card_seconds}s)"
         )
 
         # Test Redis connection
@@ -400,12 +420,14 @@ class StockApp:
 
         self.icon_uploader.upload_all([UP_ICON, DOWN_ICON])
 
-        # Fetch once synchronously before entering the loop so the tape
-        # has real data on its very first frame instead of starting on
-        # the loading fallback every time the app restarts.
+        # Fetch once synchronously before entering the loop so the first
+        # card has real data instead of starting on the loading fallback
+        # every time the app restarts.
         self.refresh_quotes()
         self.last_fetch = time.time()
         self.cycle_started_at = time.time()
+        self.card_started_at = time.time()
+        self.publish_current_card()
 
         try:
             while not self.shutdown:
@@ -428,32 +450,22 @@ class StockApp:
                             f"Active window done, resting for "
                             f"{self.rest_seconds}s"
                         )
-                    else:
-                        available = [
-                            t for t in self.tickers if t in self.quotes
-                        ]
-                        if available:
-                            total_width = SEGMENT_WIDTH * len(available)
-                            self.scroll_position = (
-                                self.scroll_position
-                                + self.scroll_speed * self.tick_seconds
-                            ) % total_width
-
-                        elements = self.build_frame()
-                        try:
-                            self.publish_to_redis(elements)
-                        except Exception as e:
-                            logger.error(f"Error publishing frame: {e}")
+                    elif (now - self.card_started_at) >= self.card_seconds:
+                        self.advance_card()
+                        self.card_started_at = now
 
                 else:  # resting - stay silent, let ownership lapse
                     if cycle_elapsed >= self.rest_seconds:
                         self.cycle_state = "active"
                         self.cycle_started_at = now
-                        self.scroll_position = 0.0
+                        self.card_index = 0
+                        self.card_started_at = now
                         logger.debug("Rest complete, starting active window")
+                        self.publish_current_card()
 
-                # Wait for next tick (check shutdown frequently, every 100ms)
-                for _ in range(max(1, int(self.tick_seconds * 10))):
+                # Check shutdown frequently (every 100ms) while waiting
+                # for the next second-ish of wall-clock time to pass.
+                for _ in range(10):
                     if self.shutdown:
                         break
                     time.sleep(0.1)
@@ -466,7 +478,7 @@ class StockApp:
 def main():
     """Entry point for stocks app."""
     parser = argparse.ArgumentParser(
-        description="BusyBar stocks ticker-tape sub-app (publishes to Redis)"
+        description="BusyBar stocks sub-app (publishes to Redis)"
     )
     parser.add_argument(
         "--app_id",
@@ -485,10 +497,10 @@ def main():
     )
     parser.add_argument(
         "--tickers",
-        default="VGT,AAPL,MSFT,GOOGL,AMZN,VOO",
+        default="VOO,VTI,AAPL,MSFT,GOOGL,AMZN",
         help=(
             "Comma-separated ticker symbols to cycle through "
-            "(default: VGT,AAPL,MSFT,GOOGL,AMZN,VOO)"
+            "(default: AAPL,MSFT,GOOGL,AMZN)"
         ),
     )
     parser.add_argument(
@@ -498,19 +510,12 @@ def main():
         help="How often to refetch prices, in seconds (default: 60)",
     )
     parser.add_argument(
-        "--scroll_speed",
+        "--card_seconds",
         type=float,
-        default=14.0,
-        help="Ticker-tape scroll speed in pixels/second (default: 14.0)",
-    )
-    parser.add_argument(
-        "--tick_seconds",
-        type=float,
-        default=0.4,
+        default=30.0,
         help=(
-            "Animation/publish tick interval in seconds (default: 0.4). "
-            "The controller only redraws about twice a second, so there's "
-            "little benefit setting this much lower."
+            "How long each ticker's card stays on screen before advancing "
+            "to the next (default: 30.0)"
         ),
     )
     parser.add_argument(
@@ -518,18 +523,19 @@ def main():
         type=int,
         default=3,
         help=(
-            "Grace period (seconds) added on top of the tick interval "
-            "before a published frame is considered stale (default: 3)."
+            "Grace period (seconds) added on top of card_seconds before a "
+            "published card is considered stale (default: 3)."
         ),
     )
     parser.add_argument(
         "--active_seconds",
         type=float,
-        default=25.0,
+        default=None,
         help=(
             "How long each active window lasts before this app "
-            "deliberately goes quiet and hands the display back "
-            "(default: 25.0)"
+            "deliberately goes quiet and hands the display back. Defaults "
+            "to one full lap through every configured ticker "
+            "(card_seconds * number of tickers)."
         ),
     )
     parser.add_argument(
@@ -565,8 +571,7 @@ def main():
         priority=args.priority,
         tickers=args.tickers.split(","),
         interval_seconds=args.interval,
-        scroll_speed=args.scroll_speed,
-        tick_seconds=args.tick_seconds,
+        card_seconds=args.card_seconds,
         stale_buffer_seconds=args.stale_buffer,
         active_seconds=args.active_seconds,
         rest_seconds=args.rest_seconds,
