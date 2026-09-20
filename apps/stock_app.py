@@ -54,6 +54,11 @@ import math
 import signal
 import sys
 import time
+from datetime import datetime
+try:
+    import zoneinfo
+except ImportError:
+    zoneinfo = None
 from pathlib import Path
 
 import redis
@@ -249,6 +254,20 @@ class StockApp:
 
         return price, previous_close
 
+    def is_market_active(self) -> bool:
+        """Check if US stock market is active (Mon-Fri, 8am-5pm ET)."""
+        if zoneinfo:
+            try:
+                now = datetime.now(zoneinfo.ZoneInfo("America/New_York"))
+            except Exception:
+                now = datetime.now()
+        else:
+            now = datetime.now()
+            
+        if now.weekday() > 4:
+            return False
+        return 8 <= now.hour < 17
+
     def refresh_quotes(self) -> None:
         """Refetch every configured ticker, updating self.quotes.
 
@@ -383,6 +402,9 @@ class StockApp:
 
     def publish_to_redis(self, elements: list) -> None:
         """Publish a display message (one ticker card) to Redis."""
+        if not self.is_market_active():
+            return
+
         message = {
             "app_id": self.app_id,
             "priority": self.priority,
@@ -497,7 +519,7 @@ def main():
     )
     parser.add_argument(
         "--tickers",
-        default="AAPL,MSFT,GOOGL,AMZN",
+        default="VOO,VTI,VGT,AAPL,MSFT,GOOGL",
         help=(
             "Comma-separated ticker symbols to cycle through "
             "(default: AAPL,MSFT,GOOGL,AMZN)"

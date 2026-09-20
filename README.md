@@ -119,7 +119,7 @@ cutoff).
 
 ```bash
 python3 apps/weather_app.py \
-  --city "Reston, VA" --lat 38.935094 --lon -77.366724 \
+  --city "Falls Church, VA" --lat 38.8823 --lon -77.1711 \
   --interval 300 --priority 50
 ```
 
