@@ -52,7 +52,7 @@ class BusyBarController:
         self.config = self.config_manager.load_config()
         self.state = self.config_manager.load_state()
         
-        self.device_ip = self.config.get("device_ip", "10.0.4.20")
+        self.device_ip = self.config.get("device_ip", "busybar.local")
         self.redis_host = self.config.get("redis_host", "localhost")
         self.redis_port = self.config.get("redis_port", 6379)
         
@@ -197,7 +197,7 @@ class BusyBarController:
             logger.warning(f"Failed to clear display: {e}")
             return False
     
-    def _draw_to_device(self, elements: list) -> bool:
+    def _draw_to_device(self, elements: list, clear_first: bool = True) -> bool:
         """Send display elements to BusyBar device.
         
         Clears any elements left over from the previous display owner
@@ -215,7 +215,7 @@ class BusyBarController:
                 "application_name": APPLICATION_NAME,
                 "elements": elements,
                 }, 
-                clear_before_draw=True
+                clear_before_draw=clear_first
             )
             logger.debug(f"Display updated ({len(elements)} elements)")
             return True
@@ -340,7 +340,7 @@ class BusyBarController:
                             f"(priority={current_msg.priority})"
                         )
                     
-                    self._draw_to_device(current_msg.elements)
+                    self._draw_to_device(current_msg.elements, clear_first=owner_changed)
                     current_display_key = display_key
                     current_display_owner = current_msg.app_id
                     

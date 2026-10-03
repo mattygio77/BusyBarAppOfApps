@@ -58,7 +58,7 @@ class ConfigManager:
     def _default_config() -> Dict[str, Any]:
         """Default configuration."""
         return {
-            "device_ip": "10.0.4.20",
+            "device_ip": "busybar.local",
             "redis_host": "localhost",
             "redis_port": 6379,
             "apps": [

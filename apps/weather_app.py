@@ -75,7 +75,7 @@ class WeatherApp:
         stale_buffer_seconds: int = 10,
         redis_host: str = "localhost",
         redis_port: int = 6379,
-        device_ip: str = "10.0.4.20",
+        device_ip: str = "busybar.local",
         city_name: str = "Falls Church, VA",
         latitude: float = 38.8823,
         longitude: float = -77.1711,
@@ -391,8 +391,8 @@ def main():
     )
     parser.add_argument(
         "--device_ip",
-        default="10.0.4.20",
-        help="BusyBar device IP (default: 10.0.4.20)",
+        default="busybar.local",
+        help="BusyBar device host/IP (default: busybar.local)",
     )
     parser.add_argument(
         "--city",

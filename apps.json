@@ -1,5 +1,5 @@
 {
-  "device_ip": "192.168.1.162",
+  "device_ip": "busybar.local",
   "redis_host": "localhost",
   "redis_port": 6379,
   "apps": [
@@ -18,6 +18,14 @@
       "proposed_interval_seconds": 60,
       "override_interval_seconds": null,
       "default_priority": 60
+    },
+    {
+      "id": "nhl",
+      "path": "./apps/nhl_app.py",
+      "enabled": true,
+      "proposed_interval_seconds": 60,
+      "override_interval_seconds": null,
+      "default_priority": 70
     }
   ]
 }

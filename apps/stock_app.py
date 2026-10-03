@@ -117,7 +117,7 @@ class StockApp:
         rest_seconds: float = 25.0,
         redis_host: str = "localhost",
         redis_port: int = 6379,
-        device_ip: str = "10.0.4.20",
+        device_ip: str = "busybar.local",
     ):
         """Initialize the stocks app.
 
@@ -582,8 +582,8 @@ def main():
     )
     parser.add_argument(
         "--device_ip",
-        default="10.0.4.20",
-        help="BusyBar device IP (default: 10.0.4.20)",
+        default="busybar.local",
+        help="BusyBar device host/IP (default: busybar.local)",
     )
 
     args = parser.parse_args()
