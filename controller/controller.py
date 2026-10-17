@@ -168,8 +168,8 @@ class BusyBarController:
             try:
                 msg = DisplayMessage.from_json(message["data"])
                 logger.debug(
-                    f"Received message from {msg.app_id} "
-                    f"(priority={msg.priority}, duration={msg.duration_seconds}s)"
+                    f"Received message from {msg.app_id} (card={msg.card_id or 'default'}, "
+                    f"priority={msg.priority}, duration={msg.duration_seconds}s)"
                 )
                 self.display_queue.add_message(msg)
             except Exception as e:
@@ -202,22 +202,19 @@ class BusyBarController:
         
         Clears any elements left over from the previous display owner
         first, since draws are additive/upsert-by-id, not a full replace.
-        The clear is best-effort: if it fails we still attempt the draw
-        rather than bailing out entirely (mirrors the previous behavior
-        of calling _clear_device() and ignoring its return value).
         
         Returns:
             True if successful, False otherwise.
         """
-        
         try:
-            self.busybar.display_draw({
-                "application_name": APPLICATION_NAME,
-                "elements": elements,
-                }, 
-                clear_before_draw=clear_first
+            self.busybar.display_draw(
+                {
+                    "application_name": APPLICATION_NAME,
+                    "elements": elements,
+                },
+                clear_before_draw=clear_first,
             )
-            logger.debug(f"Display updated ({len(elements)} elements)")
+            logger.debug(f"Display updated ({len(elements)} elements, clear_first={clear_first})")
             return True
         except BusyBarError as e:
             logger.warning(f"Failed to draw to device: {e}")
@@ -237,17 +234,20 @@ class BusyBarController:
         # Check if it's time to rotate
         rotated = False
         if (current_time - self.last_idle_rotation) > self.idle_cycle:
-            self.idle_index = (self.idle_index + 1) % max(len(self.idle_content), 1)
+            new_index = (self.idle_index + 1) % max(len(self.idle_content), 1)
+            rotated = new_index != self.idle_index
+            self.idle_index = new_index
             self.last_idle_rotation = current_time
-            rotated = True
         
         if self._idle_message is not None and not rotated:
             return self._idle_message
         
-        # If no idle content, use a default message
+        # If no idle content, use a default message (no element 'timeout' so it
+        # doesn't vanish after 6 seconds while idle remains active).
         if not self.idle_content:
             self._idle_message = DisplayMessage(
                 app_id="idle",
+                card_id="default",
                 priority=0,
                 duration_seconds=999999,
                 elements=[
@@ -256,19 +256,22 @@ class BusyBarController:
                         "type": "text",
                         "text": "Ready...",
                         "x": 15,
-                        "y": 7,
+                        "y": 4,
                         "font": "small",
                         "color": "#FFFFFFFF",
-                        "width": 72,
+                        "width": 57,
+                        "align": "top_left",
                         "scroll_rate": 0,
-                        "timeout": 6,
+                        "display": "front",
                     }
                 ],
             )
         else:
-            content = self.idle_content[self.idle_index]
+            content = dict(self.idle_content[self.idle_index])
+            content.pop("timeout", None)
             self._idle_message = DisplayMessage(
                 app_id="idle",
+                card_id=f"idle_{self.idle_index}",
                 priority=0,
                 duration_seconds=999999,
                 elements=[content],
@@ -295,14 +298,10 @@ class BusyBarController:
         
         logger.info("Controller ready, entering main loop...")
         
-        # Identity of what's currently drawn on the device: (app_id,
-        # message timestamp). Comparing on the message's own timestamp,
-        # not just app_id, is what lets an app that's already the display
-        # owner push an updated draw (e.g. weather's temperature ticking
-        # over) instead of being silently ignored because its app_id
-        # hasn't changed.
         current_display_key: Optional[tuple] = None
-        current_display_owner: Optional[str] = None
+        current_display_slot: Optional[tuple] = None
+        current_display_elements: Optional[list] = None
+        current_element_ids: set = set()
         current_owner_since: Optional[float] = None
         
         try:
@@ -311,45 +310,73 @@ class BusyBarController:
                 
                 # Get current display owner: highest priority message,
                 # guaranteed its own duration_seconds of screen time unless
-                # boot off by something strictly higher priority.
+                # booted off by something strictly higher priority.
                 current_msg = self.display_queue.get_current(current_time)
                 
                 # If no app owns display, show idle content
                 if current_msg is None:
                     current_msg = self._get_idle_message()
                 
-                display_key = (current_msg.app_id, current_msg.timestamp)
+                slot_key = current_msg.slot_key
+                display_key = (slot_key, current_msg.timestamp)
                 
-                # Redraw whenever the message actually on screen has
-                # changed - whether that's a new app taking ownership or
-                # the same app pushing fresh content while it still owns
-                # the display.
                 if display_key != current_display_key:
-                    owner_changed = current_msg.app_id != current_display_owner
-                    if owner_changed:
+                    slot_changed = slot_key != current_display_slot
+                    elements_changed = current_msg.elements != current_display_elements
+                    new_element_ids = {
+                        e.get("id") for e in current_msg.elements
+                        if isinstance(e, dict) and "id" in e
+                    }
+                    # Clear first if the active slot changed OR if the same slot
+                    # dropped any previously drawn element ID (since display_draw
+                    # is additive upsert-by-id).
+                    removed_ids = bool(current_element_ids - new_element_ids)
+                    clear_first = slot_changed or removed_ids
+                    
+                    if slot_changed:
+                        prev_label = (
+                            f"{current_display_slot[0]}:{current_display_slot[1]}"
+                            if current_display_slot else None
+                        )
                         logger.info(
-                            f"Display ownership: {current_display_owner} → "
-                            f"{current_msg.app_id} "
+                            f"Display ownership: {prev_label} → "
+                            f"{slot_key[0]}:{slot_key[1]} "
                             f"(priority={current_msg.priority})"
                         )
                         current_owner_since = current_time
-                    else:
-                        logger.debug(
-                            f"Refreshing display content for "
-                            f"{current_msg.app_id} "
-                            f"(priority={current_msg.priority})"
-                        )
                     
-                    self._draw_to_device(current_msg.elements, clear_first=owner_changed)
+                    # Only send an HTTP draw call when switching slots or when
+                    # the elements actually changed; if an app republished the
+                    # exact same elements just to renew its lease, skip the
+                    # draw so hardware marquee scrolling never resets mid-scroll.
+                    if slot_changed or elements_changed:
+                        if not slot_changed:
+                            logger.debug(
+                                f"Refreshing display content for "
+                                f"{slot_key[0]}:{slot_key[1]} "
+                                f"(priority={current_msg.priority})"
+                            )
+                        self._draw_to_device(current_msg.elements, clear_first=clear_first)
+                        current_display_elements = current_msg.elements
+                        current_element_ids = new_element_ids
+                    
                     current_display_key = display_key
-                    current_display_owner = current_msg.app_id
+                    current_display_slot = slot_key
+                    
+                    owner_started = (
+                        self.display_queue.current_owner_started_at
+                        if self.display_queue.current_owner_key == slot_key
+                        and self.display_queue.current_owner_started_at is not None
+                        else current_owner_since
+                    )
                     
                     # Update state
                     self.state["current_owner"] = {
                         "app_id": current_msg.app_id,
+                        "card_id": current_msg.card_id or "default",
                         "priority": current_msg.priority,
-                        "since": current_owner_since,
-                        "expires_at": current_owner_since + current_msg.duration_seconds,
+                        "since": owner_started,
+                        "expires_at": (owner_started or current_time) + current_msg.duration_seconds,
                     }
                     self.state["queue"] = self.display_queue.get_queue_snapshot(
                         current_time

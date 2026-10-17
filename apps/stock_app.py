@@ -375,18 +375,19 @@ class StockApp:
             }
         ]
 
-    def _current_card_elements(self) -> list:
-        """Elements for whichever ticker card.card_index points at."""
+    def _current_card_elements(self) -> tuple:
+        """Return (card_id, elements) for whichever ticker card_index points at."""
         available = self._available_tickers()
         if not available:
-            return self._loading_message()
+            return "loading", self._loading_message()
         ticker = available[self.card_index % len(available)]
-        return self._card_elements(ticker)
+        return ticker, self._card_elements(ticker)
 
     def publish_current_card(self) -> None:
         """Publish (once) whichever ticker card is currently selected."""
         try:
-            self.publish_to_redis(self._current_card_elements())
+            card_id, elements = self._current_card_elements()
+            self.publish_to_redis(elements, card_id=card_id)
         except Exception as e:
             logger.error(f"Error publishing card: {e}")
 
@@ -400,13 +401,14 @@ class StockApp:
             self.card_index = (self.card_index + 1) % len(available)
         self.publish_current_card()
 
-    def publish_to_redis(self, elements: list) -> None:
+    def publish_to_redis(self, elements: list, card_id: str = "default") -> None:
         """Publish a display message (one ticker card) to Redis."""
         if not self.is_market_active():
             return
 
         message = {
             "app_id": self.app_id,
+            "card_id": card_id,
             "priority": self.priority,
             "duration_seconds": self.duration_seconds,
             "timestamp": time.time(),
@@ -417,7 +419,7 @@ class StockApp:
         self.redis_client.publish(self.redis_channel, msg_json)
 
         logger.debug(
-            f"Published card to {self.redis_channel} "
+            f"Published card '{card_id}' to {self.redis_channel} "
             f"({len(elements)} elements)"
         )
 

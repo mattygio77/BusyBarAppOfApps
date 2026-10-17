@@ -1,7 +1,7 @@
 """Display message data structure and validation."""
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import time
 import json
 
@@ -16,10 +16,14 @@ class DisplayMessage:
         duration_seconds: How long this message should own the display once
             it becomes the display owner (see DisplayQueue). Also bounds how
             long the message is willing to sit in the queue waiting for its
-            turn: if it never becomes the owner within duration_seconds of
-            being published, it's dropped as stale (see is_expired).
+            turn unless ttl_seconds is specified (see is_expired).
         elements: List of BusyBar display elements (JSON-compatible dicts)
         timestamp: When the message was published (Unix timestamp)
+        card_id: Optional identifier for a specific card/screen within an app
+            (e.g. ticker symbol 'AAPL' or matchup 'CAR@WSH'), allowing an app
+            to queue multiple distinct displays without overwriting itself.
+        ttl_seconds: Optional queue expiration window (in seconds) if longer
+            than duration_seconds.
     """
     
     app_id: str
@@ -27,17 +31,23 @@ class DisplayMessage:
     duration_seconds: int
     elements: List[Dict[str, Any]]
     timestamp: float = field(default_factory=time.time)
+    card_id: Optional[str] = None
+    ttl_seconds: Optional[int] = None
     
     def __post_init__(self):
         """Validate message on construction."""
         if not self.app_id or not isinstance(self.app_id, str):
             raise ValueError("app_id must be a non-empty string")
         
-        if not isinstance(self.priority, int) or not (0 <= self.priority <= 100):
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int) or not (0 <= self.priority <= 100):
             raise ValueError("priority must be int 0-100")
         
-        if not isinstance(self.duration_seconds, int) or self.duration_seconds <= 0:
+        if isinstance(self.duration_seconds, bool) or not isinstance(self.duration_seconds, int) or self.duration_seconds <= 0:
             raise ValueError("duration_seconds must be positive int")
+        
+        if self.ttl_seconds is not None:
+            if isinstance(self.ttl_seconds, bool) or not isinstance(self.ttl_seconds, int) or self.ttl_seconds <= 0:
+                raise ValueError("ttl_seconds must be positive int")
         
         if not isinstance(self.elements, list) or len(self.elements) == 0:
             raise ValueError("elements must be non-empty list")
@@ -51,6 +61,11 @@ class DisplayMessage:
             if elem["type"] not in ("text", "image"):
                 raise ValueError(f"Unknown element type: {elem['type']}")
     
+    @property
+    def slot_key(self) -> Tuple[str, str]:
+        """Composite key (app_id, card_id) identifying this display slot in DisplayQueue."""
+        return (self.app_id, self.card_id or "default")
+    
     def is_expired(self, current_time: float = None) -> bool:
         """Check if this message has been waiting too long for its turn.
         
@@ -63,7 +78,12 @@ class DisplayMessage:
         """
         if current_time is None:
             current_time = time.time()
-        return (current_time - self.timestamp) > self.duration_seconds
+        effective_ttl = (
+            self.ttl_seconds
+            if self.ttl_seconds is not None
+            else self.duration_seconds
+        )
+        return (current_time - self.timestamp) > effective_ttl
     
     @classmethod
     def from_json(cls, json_str: str) -> "DisplayMessage":
@@ -75,14 +95,21 @@ class DisplayMessage:
             duration_seconds=data["duration_seconds"],
             elements=data["elements"],
             timestamp=data.get("timestamp", time.time()),
+            card_id=data.get("card_id"),
+            ttl_seconds=data.get("ttl_seconds"),
         )
     
     def to_json(self) -> str:
         """Serialize to JSON string."""
-        return json.dumps({
+        payload = {
             "app_id": self.app_id,
             "priority": self.priority,
             "duration_seconds": self.duration_seconds,
             "elements": self.elements,
             "timestamp": self.timestamp,
-        })
+        }
+        if self.card_id is not None:
+            payload["card_id"] = self.card_id
+        if self.ttl_seconds is not None:
+            payload["ttl_seconds"] = self.ttl_seconds
+        return json.dumps(payload)

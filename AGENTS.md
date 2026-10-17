@@ -18,81 +18,112 @@ narrower - conventions, invariants, and gotchas for changing the code.
 ## Hard rules
 
 1. **Don't generate icons in code.** Pull them from the internet - use
-   [googlefonts/noto-emoji](https://github.com/googlefonts/noto-emoji) as a
+   [googlefonts/noto-emoji](https://github.com/googlefonts/noto-emoji) or
+   official team logo CDNs (like ESPN's NHL CDN in `nhl_app.py`) as a
    resource. It's fine to post-process a sourced image (resize to 16x16,
    crop, or recolor by masking/re-tinting an extracted shape) - the
    requirement is that the underlying shape comes from a real downloaded
-   asset, not hand-drawn polygons/lines in PIL or similar.
+   asset, not hand-drawn polygons/lines/letters in PIL or similar.
 2. **Upload icons through `apps/icon_uploader.py`'s `IconUploader`, not ad
-   hoc `busylib` calls.** Both existing apps use it; it owns the `BusyBar`
-   client and caches what's already been uploaded this run. A new app
-   needing icons should do the same rather than re-implementing upload
-   logic. Note `apps/` has no `__init__.py` - it's not a package, and
-   every app is invoked directly (`python3 apps/foo_app.py`), which puts
-   `apps/` on `sys.path[0]`. That's what makes `from icon_uploader import
-   IconUploader` resolve as a plain sibling import. Don't switch to a
-   relative/package-style import unless the invocation style changes too.
+   hoc `busylib` calls.** Existing apps (`weather_app.py`, `stock_app.py`,
+   `nhl_app.py`) all use it; it owns the `BusyBar` client and caches what's
+   already been uploaded this run. A new app needing icons should do the
+   same rather than re-implementing upload logic. Note `apps/` has no
+   `__init__.py` - it's not a package, and every app is invoked directly
+   (`python3 apps/foo_app.py`), which puts `apps/` on `sys.path[0]`. That's
+   what makes `from icon_uploader import IconUploader` resolve as a plain
+   sibling import. Don't switch to a relative/package-style import unless
+   the invocation style changes too.
 3. **`display_draw` is additive (upsert-by-id), not a full-screen
-   replace.** An element from a previous owner that isn't redeclared will
-   keep showing. The controller handles this globally via
-   `clear_before_draw=True` on its one `display_draw` call - a sub-app
-   itself never needs to clear anything, it just needs to make sure every
-   element it cares about is included in the message it publishes (see
-   the stocks app's segment culling for an example of "only include what
-   should currently be visible").
+   replace.** An element from a previous draw that isn't redeclared will
+   keep showing unless cleared. `controller.py` handles this automatically
+   by passing `clear_before_draw=True` whenever:
+   - the active `(app_id, card_id)` slot changes, **or**
+   - the active slot drops any previously drawn element `id`
+     (`bool(current_element_ids - new_element_ids)`).
+   Because the controller detects removed element IDs automatically, a
+   sub-app switching layouts (e.g. `nhl_app.py` switching from its
+   4-element scoreboard to its 1-element goal animation and back) should
+   keep its normal `app_id` rather than inventing a fake `app_id` (like
+   `nhl_anim`) just to force a screen clear.
 4. **Every `busylib` field must be the correct native Python type.**
    `scroll_rate`, `priority`, `duration_seconds`, etc. must be `int`, not
    `str` - a wrong type has silently been ignored by the API in the past
    rather than erroring, which made it hard to notice.
-5. **`duration_seconds` must be a positive `int`** (see
-   `controller/message.py`'s `DisplayMessage.__post_init__`). If you're
-   computing it from a sub-second tick interval, round up
-   (`math.ceil(...)`) before adding any buffer - see `stock_app.py`.
+5. **`duration_seconds` (and optional `ttl_seconds`) must be a positive
+   `int`** (see `controller/message.py`'s `DisplayMessage.__post_init__`).
+   If you're computing it from a sub-second or float interval, round up
+   (`math.ceil(...)`) before adding any buffer - see `stock_app.py` and
+   `nhl_app.py`.
 
-## Display-ownership mechanics (read before adding a new app)
+## Display-ownership & multi-card queue mechanics (read before adding a new app)
 
-`controller/display_queue.py` implements this; the summary:
+`controller/display_queue.py` and `controller/message.py` implement this;
+the summary:
 
-- The highest-priority, non-expired message owns the display.
-- Once an app owns the display, **only a strictly higher priority message
-  can preempt it early.** Equal-or-lower priority messages just wait, and
-  are dropped as stale if they wait longer than their own
-  `duration_seconds` without ever being shown.
-- An app that republishes fresh content before its own `duration_seconds`
-  elapses effectively renews its ownership and never naturally lets go.
-  Weather does this deliberately (`duration_seconds = interval +
-  stale_buffer`) so it behaves like an "always-on default" screen.
-- **Gotcha:** two apps that are both designed to renew indefinitely at
-  equal-or-different-but-static priority will result in ONE of them
-  permanently owning the display and the other never showing at all - the
-  lower/later one just keeps expiring as stale before ever winning. This
-  bit us when adding the stocks app. If a new app needs to coexist with an
-  existing always-on app, don't just pick a priority number - either:
-  (a) give it a strictly higher priority AND make it deliberately stop
-  publishing for a while on a duty cycle (active/rest), like
-  `stock_app.py` does, so its own ownership lapses and hands control back,
-  or
-  (b) keep it strictly lower priority and accept that it only ever shows
-  during gaps when nothing higher-priority is currently claiming the
-  display (fine for genuinely occasional content, not for something
-  meant to be seen regularly).
-- Redraw identity is `(app_id, message.timestamp)`, not `app_id` alone
-  (see `controller.py`'s main loop) - this is what lets an app that's
-  already the owner push updated content (weather's temperature changing,
-  stocks' scroll position advancing) without being ignored because its
-  `app_id` didn't change. Always give a fresh message a new `timestamp`
-  (the `DisplayMessage`/`publish_to_redis` pattern both existing apps use
-  does this automatically via `time.time()`).
-- Idle content (`apps.json`'s `idle_rotation`) is priority 0 and is
-  synthesized by the controller itself, not published by any app - it's
-  what shows when nothing else is claiming the display.
+- **Composite slot keys (`slot_key = (app_id, card_id)`):**
+  - `DisplayMessage` accepts an optional `card_id` (defaulting to
+    `"default"` if omitted) and an optional `ttl_seconds` (queue expiration
+    window independent of on-screen dwell `duration_seconds`).
+  - Queue slots are keyed by `(app_id, card_id)` (capped at
+    `max_cards_per_app=10` per app). This allows a single app to queue
+    multiple distinct cards (e.g. `("stocks", "VOO")`, `("stocks", "AAPL")`)
+    alongside cards from separate apps (`("nhl", "WSH")`,
+    `("weather", "default")`) without overwriting its other pending cards.
+  - Publishing a message with an existing `(app_id, card_id)` updates that
+    specific slot in-place.
+- **Priority & guaranteed dwell time:**
+  - The highest-priority, non-expired slot owns the display for its full
+    `duration_seconds` (counted from when it *became* the owner, not when
+    it was published).
+  - **Only a strictly higher priority message can preempt the current owner
+    early.** If the preempting message belongs to the *same* `app_id` (such
+    as a priority-100 goal animation preempting that app's normal
+    scoreboard), `DisplayQueue` retires the old slot from that app so it
+    doesn't linger behind.
+  - Among equal-priority candidates waiting in the queue, `_best_candidate()`
+    interleaves fairly across apps (preferring the app that least recently
+    owned the screen via `_app_last_turn_seq`) and breaks ties within the
+    same app by earliest publish `timestamp` (FIFO).
+- **Queue expiration (`ttl_seconds` vs. `duration_seconds`):**
+  - Waiting messages that haven't yet become the display owner expire after
+    `ttl_seconds` if provided, or `duration_seconds` otherwise. If an app
+    publishes cards with a short on-screen `duration_seconds` (e.g. 4s)
+    that may need to wait behind a 15s-30s owner, set `ttl_seconds` (e.g.
+    `60`) so the card isn't dropped as stale before its turn arrives.
+- **Coexisting with an always-on default app (`weather`):**
+  - An app that republishes fresh content on the same `(app_id, card_id)`
+    before its `duration_seconds` elapses renews its ownership and never
+    naturally lets go. Weather does this deliberately (`duration_seconds =
+    interval + stale_buffer`) at priority `50`.
+  - **Gotcha:** Higher-priority apps (`stocks` at `60`, `nhl` at `70` when
+    live) must use an **active/rest duty cycle**: publish during the
+    `active_seconds` window (sizing `duration_seconds` to the remaining
+    active window + buffer, not a fixed `active_seconds + 10` on every
+    tick!), and **stop publishing completely during the `rest_seconds`
+    window** so ownership expires on time and hands the screen back to
+    lower-priority apps.
+- **Content-aware redraw deduplication (preventing marquee scroll resets):**
+  - Every `display_draw` call to the BusyBar resets hardware text scrolling
+    back to pixel 0 (restarting `scroll_start_delay`).
+  - To prevent scrolling text from stuttering or freezing, `controller.py`
+    tracks `(slot_key, message.timestamp)` to update lease/queue state in
+    `state.json`, **but only calls `_draw_to_device()` if `slot_changed` or
+    `current_msg.elements != current_display_elements`**.
+  - Sub-apps should also avoid republishing unchanged static/scrolling
+    frames at 1 Hz (see `nhl_app.py`'s `_publish_if_needed()`, which only
+    publishes when elements/priority change or when the active lease is
+    within `stale_buffer_seconds` of expiring).
+- **Idle content (`apps.json`'s `idle_rotation`):**
+  - Synthesized by the controller at priority `0` when the queue is empty.
+  - Never include a `"timeout"` field on idle elements (or persistent app
+    elements), as firmware element timeouts erase the element on-device
+    while the controller still considers the idle message active.
 
 ## Display element schema
 
-Elements are plain dicts (not currently using `busylib`'s
-`TextElement`/`ImageElement` classes, though those exist and could be
-adopted). Every element needs `id` and `type` (`"text"` or `"image"`).
-For the full field reference (fonts: `tiny`/`small`/`normal`/
+Elements are plain dicts. Every element needs `id` and `type` (`"text"` or
+`"image"`). For the full field reference (fonts: `tiny`/`small`/`normal`/
 `condensed`/`bold`/`large`/`extra_large`/`global`; alignment options;
 scroll fields), see `busylib`'s own
 [`docs/guides/displays.md`](https://github.com/busy-app/busylib-py/blob/main/docs/guides/displays.md) -
@@ -102,33 +133,28 @@ Things that have caused real bugs here before:
 - Omitting `align`, `scroll_start_delay`, or `scroll_repeat_delay` on text
   elements has caused clipping - set them explicitly rather than relying
   on defaults.
-- `scroll_rate` is millisecond-scale (~1000 = normal reading speed); a
+- `scroll_rate` is millisecond-scale (~400-1000 = normal reading speed); a
   small integer barely scrolls.
-- If you're manually animating an element's position frame-to-frame
-  (like the stocks tape does, panning `x` every tick), set that element's
-  own `scroll_rate: 0` (and the delay fields to `0`) so the device's
-  built-in per-element scroll doesn't ALSO move it independently of your
-  manual positioning.
-- Front display is 72px wide x 16px tall. Leave yourself real margin -
-  icons here are 16x16, text columns have generally used 40-54px widths.
+- Do not set `"timeout"` on text elements unless you specifically want the
+  BusyBar firmware to blank that element before the message's
+  `duration_seconds` finishes (this previously caused default idle text to
+  disappear after 6 seconds while the screen stayed in idle mode).
+- Front display is 72px wide x 16px tall:
+  - Single left icon (`x=0..15`, 16x16) + right text column: place text at
+    `x=18`, `width=54` (`18 + 54 = 72`).
+  - Dual edge icons (`my_logo` at `x=0..15`, `opp_logo` at `x=56..71`, as
+    in `nhl_app.py`): center text at `x=36` with `align="top_mid"` and
+    `width=38` so the text box stays strictly inside the `17..55` gap
+    without overlapping the right-hand icon.
 
 ## Known quirks worth knowing before you touch things
 
-- `controller.py` defines `_clear_device()` but nothing currently calls
-  it - clearing happens via `clear_before_draw=True` passed directly to
-  `busylib`'s `display_draw()`. It's dead code, not a bug; don't assume
-  it's in the active call path.
+- `controller.py` defines `_clear_device()` as a standalone helper, while
+  normal frame transitions clear via `clear_before_draw=clear_first` passed
+  directly to `busylib`'s `display_draw()`.
 - `main.py` does not spawn `apps/*_app.py` as subprocesses. Everything is
   started manually in separate terminals. If you're asked to fix this,
   it's a real gap, not an oversight to work around quietly - flag it.
-- Idle rotation only actually triggers a redraw when the display first
-  goes idle, not on every rotation through multiple idle items (deferred,
-  low-impact while only one idle item is configured).
-- Text elements have been observed disappearing after ~10s while an
-  accompanying icon element stays on screen. Root cause not yet
-  confirmed - suspected but unverified `timeout` field interaction
-  between text and image elements. Don't assume this is fixed unless
-  you've specifically verified it.
 
 ## External APIs sub-apps depend on
 
@@ -138,34 +164,37 @@ Things that have caused real bugs here before:
 - **Yahoo Finance chart endpoint** (`stock_app.py`):
   `query1.finance.yahoo.com/v8/finance/chart/{ticker}`. Unofficial and
   reverse-engineered (same one `yfinance` sits on top of), no API key,
-  and as of this writing doesn't need the crumb/cookie auth handshake
-  the older `v7/finance/quote` endpoint requires - but that could change
-  without notice since it's not a supported API. Requires a
-  browser-like `User-Agent` header or requests get rejected. If stock
-  data stops working, check this first.
+  requires a browser-like `User-Agent` header or requests get rejected.
+  Publishes each ticker card with `"card_id": ticker` during market hours.
+- **NHL Web API & ESPN Team Logos CDN** (`nhl_app.py`):
+  - Scoreboard/clock data: `https://api-web.nhle.com/v1/score/now`.
+  - Team logos: downloaded on demand as stock 500x500 PNGs from
+    `https://a.espncdn.com/i/teamlogos/nhl/500/{slug}.png`, resized to
+    16x16 RGBA (`Image.Resampling.LANCZOS`), and cached in
+    `apps/nhl/icons/<abbrev>.png` (e.g. `wsh.png` for the Washington
+    Capitals; `--my_logo` defaults to `None` so the stock logo is used
+    unless explicitly overridden).
+  - `ESPN_SLUG_MAP` translates the few NHL API 3-letter codes that differ
+    on ESPN's CDN (`LAK -> la`, `NJD -> nj`, `SJS -> sj`, `TBL -> tb`,
+    `UTA -> utah`).
 
 ## Adding a new sub-app - checklist
 
 1. Create `apps/<name>_app.py` following the existing pattern: argparse
    CLI, a class with a `run()` loop, publish `DisplayMessage`-shaped JSON
-   (see `controller/message.py`) to Redis channel `busybar:app:<id>`.
+   (including `card_id` if the app publishes multiple distinct cards, and
+   `ttl_seconds` if cards have short dwell times) to Redis channel
+   `busybar:app:<id>`.
 2. If it needs icons, use `apps/icon_uploader.py`'s `IconUploader` (see
    Hard rule #2) and source assets per Hard rule #1.
-3. Decide priority deliberately per the ownership mechanics above - don't
-   just pick a free-looking number. Document *why* in a comment, the way
-   `stock_app.py`'s module docstring explains its priority-60-as-
-   interrupter choice.
+3. Decide priority and duty cycle deliberately per the ownership mechanics
+   above - if it's an interrupter above priority 50, make sure it stops
+   publishing during its rest window and sizes `duration_seconds` to the
+   remaining active window so it hands the display back cleanly.
 4. Add an entry to `apps.json`'s `apps` list (`id`, `path`, `enabled`,
-   plus whatever interval/priority fields match the existing entries'
-   shape).
-5. Sanity-check the pure logic (position/timing math, formatting, edge
-   cases) standalone before wiring it to Redis/busylib - both existing
-   apps' scroll/rotation math were verified this way during development,
-   independent of needing a live device or Redis instance.
-6. `python3 -m py_compile apps/<name>_app.py` at minimum; ideally also
-   import and construct the class against a stub `busylib` (see how
-   `icon_uploader.py`'s integration was verified) since there's no BusyBar
-   hardware available in most dev environments.
-7. Update `README.md`'s app list and this file's "known quirks" section
-   if you've introduced (or fixed) anything future changes should know
-   about.
+   plus interval/priority fields matching the existing entries' shape).
+5. Sanity-check the pure logic standalone and run
+   `/usr/local/bin/python3.12 test_controller.py` plus
+   `/usr/local/bin/python3.12 -m py_compile apps/<name>_app.py`.
+6. Update `README.md`'s app list and this file if you've introduced (or
+   fixed) anything future changes should know about.
