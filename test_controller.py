@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test script: verify DisplayMessage, multi-display DisplayQueue, and NHL stock logo logic."""
+"""Test script: verify DisplayMessage, multi-display DisplayQueue, NHL stock logo logic, goal sounds, moving goal animation, and away/home team ordering."""
 
 import json
 import time
@@ -148,6 +148,8 @@ def test_nhl_caps_stock_logo():
             team="WSH",
             my_logo=None,
             priority=70,
+            enable_device_audio=False,
+            enable_local_audio=False,
         )
         # Mock network download if wsh.png is not yet cached on disk
         with patch.object(nhl_app.requests, "get") as mock_get:
@@ -171,6 +173,149 @@ def test_nhl_caps_stock_logo():
                 if not had_wsh and wsh_path.exists():
                     wsh_path.unlink()
     print("✓ NHLApp resolves 'WSH' to stock logo 'wsh.png' from ESPN CDN")
+    return True
+
+
+def test_nhl_goal_sounds():
+    """Verify goal horn sounds for configured team(s) and bad sound for non-configured opponent."""
+    print("\nTesting NHL goal horn, bad sound, and 2-configured-team games...")
+    import nhl_app
+    
+    # Check sound files exist on disk
+    sounds_dir = BASE_DIR / "apps" / "nhl" / "sounds"
+    assert (sounds_dir / "goal_horn.wav").exists(), "goal_horn.wav should exist in apps/nhl/sounds/"
+    assert (sounds_dir / "bad_sound.wav").exists(), "bad_sound.wav should exist in apps/nhl/sounds/"
+    
+    mock_sound_player = MagicMock()
+    with patch.object(nhl_app, "IconUploader", MagicMock()), \
+         patch.object(nhl_app, "SoundPlayer", return_value=mock_sound_player):
+        app = nhl_app.NHLApp(
+            app_id="nhl",
+            team="WSH",
+            my_logo=None,
+            priority=70,
+        )
+        assert app.sound_player is mock_sound_player, "SoundPlayer should be initialized"
+        
+        # Initial score 0-0
+        app.current_game = {
+            "awayTeam": {"abbrev": "WSH", "score": 0},
+            "homeTeam": {"abbrev": "PIT", "score": 0},
+            "gameState": "LIVE",
+        }
+        app.check_goals()
+        assert app.last_score == 0
+        assert app.last_opp_score == 0
+        mock_sound_player.play.assert_not_called()
+        
+        # 1. Configured team (WSH) scores -> goal horn
+        app.current_game["awayTeam"]["score"] = 1
+        app.check_goals()
+        mock_sound_player.play.assert_called_once_with("goal_horn.wav")
+        assert app.animating_goal is True
+        assert app.animating_opp_goal is False
+        
+        # 2. Opponent (PIT) scores -> bad sound
+        mock_sound_player.reset_mock()
+        app.current_game["homeTeam"]["score"] = 1
+        app.check_goals()
+        mock_sound_player.play.assert_called_once_with("bad_sound.wav")
+        assert app.animating_opp_goal is True
+        assert app.animating_goal is False
+        
+        # 3. Two configured teams playing each other (WSH vs CAR) -> goal horn for BOTH
+        mock_sound_player.reset_mock()
+        app_two = nhl_app.NHLApp(
+            app_id="nhl",
+            team="WSH,CAR",
+            my_logo=None,
+            priority=70,
+        )
+        app_two.current_game = {
+            "awayTeam": {"abbrev": "CAR", "score": 0},
+            "homeTeam": {"abbrev": "WSH", "score": 0},
+            "gameState": "LIVE",
+        }
+        app_two.check_goals()
+        mock_sound_player.play.assert_not_called()
+        
+        # CAR (away configured team) scores -> goal horn
+        app_two.current_game["awayTeam"]["score"] = 1
+        app_two.check_goals()
+        mock_sound_player.play.assert_called_once_with("goal_horn.wav")
+        assert app_two.animating_goal is True
+        assert app_two.animating_opp_goal is False
+        assert app_two.scoring_team == "CAR"
+        
+        # WSH (home configured team) scores -> goal horn as well
+        mock_sound_player.reset_mock()
+        app_two.current_game["homeTeam"]["score"] = 1
+        app_two.check_goals()
+        mock_sound_player.play.assert_called_once_with("goal_horn.wav")
+        assert app_two.animating_goal is True
+        assert app_two.animating_opp_goal is False
+        assert app_two.scoring_team == "WSH"
+        
+    print("✓ Goal horn plays for configured team(s) (including when 2 configured teams play), and bad sound plays for non-configured opponents")
+    return True
+
+
+def test_nhl_animation_and_away_home_order():
+    """Verify moving horn icons on goal animation and away-first / home-second ordering."""
+    print("\nTesting NHL moving goal animation and away-first / home-second ordering...")
+    import nhl_app
+    
+    icons_dir = BASE_DIR / "apps" / "nhl" / "icons"
+    assert (icons_dir / "horn_left.png").exists(), "horn_left.png should exist in apps/nhl/icons/"
+    assert (icons_dir / "horn_right.png").exists(), "horn_right.png should exist in apps/nhl/icons/"
+    
+    with patch.object(nhl_app, "IconUploader", MagicMock()), \
+         patch.object(nhl_app, "SoundPlayer", MagicMock()):
+        app = nhl_app.NHLApp(
+            app_id="nhl",
+            team="WSH",
+            my_logo=None,
+            priority=70,
+        )
+        
+        # 1. Verify goal animation has horn icons that actually move across frames
+        app.animating_goal = True
+        app.scoring_team = "WSH"
+        frame_1 = app.build_animation_elements()
+        frame_2 = app.build_animation_elements()
+        
+        by_id_1 = {e["id"]: e for e in frame_1}
+        by_id_2 = {e["id"]: e for e in frame_2}
+        assert "horn_left" in by_id_1 and "horn_right" in by_id_1, "Goal animation must include horn icons"
+        assert (by_id_1["horn_left"]["x"], by_id_1["horn_left"]["y"]) != (
+            by_id_2["horn_left"]["x"],
+            by_id_2["horn_left"]["y"],
+        ), "Left horn icon must move between animation frames"
+        assert (by_id_1["horn_right"]["x"], by_id_1["horn_right"]["y"]) != (
+            by_id_2["horn_right"]["x"],
+            by_id_2["horn_right"]["y"],
+        ), "Right horn icon must move between animation frames"
+        
+        # 2. Verify away team is listed first (x=0, first score) and home team second (x=56, second score)
+        # even when configured team (WSH) is the home team
+        app.animating_goal = False
+        app.current_game = {
+            "awayTeam": {"abbrev": "CAR", "score": 2},
+            "homeTeam": {"abbrev": "WSH", "score": 4},
+            "gameState": "LIVE",
+            "clock": {"timeRemaining": "10:00", "inIntermission": False, "running": False},
+            "periodDescriptor": {"number": 3},
+        }
+        elements = app.build_game_elements()
+        elem_by_id = {e["id"]: e for e in elements}
+        
+        assert elem_by_id["away_logo"]["path"] == "car.png"
+        assert elem_by_id["away_logo"]["x"] == 0
+        assert elem_by_id["home_logo"]["path"] == "wsh.png"
+        assert elem_by_id["home_logo"]["x"] == 56
+        assert elem_by_id["score"]["text"] == "2-4", f"Expected away-home score '2-4', got {elem_by_id['score']['text']}"
+        
+    print("✓ Goal animation moves horn icons across frames, and away team is listed first with home team second")
     return True
 
 
@@ -246,6 +391,12 @@ def main():
         all_passed = False
     
     if not test_nhl_caps_stock_logo():
+        all_passed = False
+        
+    if not test_nhl_goal_sounds():
+        all_passed = False
+
+    if not test_nhl_animation_and_away_home_order():
         all_passed = False
     
     if not test_redis_publish():
